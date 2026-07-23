@@ -3,6 +3,7 @@
 #include "audition.h"
 #include "omni.h"
 #include "token2wav/token2wav-impl.h"
+#include "token2wav/token2wav-backend-policy.h"
 
 #include "llama.h"
 #include "common/common.h"
@@ -4341,8 +4342,15 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             // Device configuration - 使用 omni_init 传入的 token2wav_device 参数
             // 格式: "gpu", "gpu:0", "gpu:1", "cpu"
 #ifdef GGML_USE_CANN
-            std::string device_token2mel = "cpu";
-            print_with_timestamp("Token2Wav: CANN流跨线程需算子适配，flow_matching暂用CPU\n");
+            std::string device_token2mel;
+            if (omni::flow::token2wav_require_npu()) {
+                device_token2mel = token2wav_device;
+                print_with_timestamp("Token2Wav: strict NPU mode, flow_matching using %s\n",
+                                     device_token2mel.c_str());
+            } else {
+                device_token2mel = "cpu";
+                print_with_timestamp("Token2Wav: CANN流跨线程需算子适配，flow_matching暂用CPU\n");
+            }
 #else
             std::string device_token2mel = token2wav_device;
 #endif
@@ -4362,8 +4370,14 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
                 device_vocoder = token2wav_device;
                 print_with_timestamp("Token2Wav: CUDA detected, vocoder using GPU (%s)\n", device_vocoder.c_str());
 #elif defined(GGML_USE_CANN)
-                device_vocoder = "cpu";
-                print_with_timestamp("Token2Wav: CANN流跨线程需算子适配，vocoder暂用CPU\n");
+                if (omni::flow::token2wav_require_npu()) {
+                    device_vocoder = token2wav_device;
+                    print_with_timestamp("Token2Wav: strict NPU mode, vocoder using %s\n",
+                                         device_vocoder.c_str());
+                } else {
+                    device_vocoder = "cpu";
+                    print_with_timestamp("Token2Wav: CANN流跨线程需算子适配，vocoder暂用CPU\n");
+                }
 #else
                 device_vocoder = "cpu";
                 print_with_timestamp("Token2Wav: no GPU backend, vocoder using CPU for better performance\n");
@@ -4427,7 +4441,7 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
                         vocoder_gguf, device_token2mel, device_vocoder, 5, 1.0f);
             }
             // Fallback to CPU
-            if (!init_ok) {
+            if (!init_ok && !omni::flow::token2wav_require_npu()) {
                 print_with_timestamp("Token2Wav: GPU init failed, trying CPU mode...\n");
                 ctx_omni->token2wav_session.reset();
                 ctx_omni->token2wav_session = std::make_unique<omni::flow::Token2WavSession>();
@@ -4450,6 +4464,13 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             }
         } else {
             print_with_timestamp("Token2Wav: model files not found in %s\n", ctx_omni->token2wav_model_dir.c_str());
+        }
+
+        if (omni::flow::token2wav_require_npu() && !ctx_omni->token2wav_initialized) {
+            LOG_ERR("Token2Wav: OMNI_REQUIRE_NPU_T2W=1 requested, but an all-CANN Token2Mel/vocoder session "
+                    "could not be initialized\n");
+            omni_free(ctx_omni);
+            return nullptr;
         }
         
         // ==================== 初始化 Python Token2Wav ====================

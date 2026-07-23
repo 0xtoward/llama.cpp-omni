@@ -1,6 +1,7 @@
 
 
 #include "token2wav-impl.h"
+#include "token2wav-backend-policy.h"
 #include "token2wav-profile.h"
 
 #include <atomic>
@@ -2213,14 +2214,14 @@ ggml_backend_t fm_loader_init_backend_gpu_idx(int gpu_idx, std::string & backend
         backend = ggml_backend_cann_init(gpu_idx);
     }
 #endif
-    if (!backend) {
+    if (!backend && !token2wav_require_npu()) {
         // fallback to generic GPU init
         backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
     }
-    if (!backend) {
+    if (!backend && !token2wav_require_npu()) {
         backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU, nullptr);
     }
-    if (!backend) {
+    if (!backend && !token2wav_require_npu()) {
         backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     }
     if (backend) {
@@ -3198,13 +3199,13 @@ ggml_backend_t ue_loader_init_backend_gpu_idx(int gpu_idx, std::string & backend
         backend = ggml_backend_cann_init(gpu_idx);
     }
 #endif
-    if (!backend) {
+    if (!backend && !token2wav_require_npu()) {
         backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
     }
-    if (!backend) {
+    if (!backend && !token2wav_require_npu()) {
         backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU, nullptr);
     }
-    if (!backend) {
+    if (!backend && !token2wav_require_npu()) {
         backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     }
     if (backend) {
@@ -6614,13 +6615,13 @@ bool voc_hg2_model::voc_hg2_model_init_from_gguf(const std::string & gguf_path_i
             backend = ggml_backend_cann_init(gpu_idx);
         }
 #endif
-        if (!backend) {
+        if (!backend && !omni::flow::token2wav_require_npu()) {
             backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
         }
-        if (!backend) {
+        if (!backend && !omni::flow::token2wav_require_npu()) {
             backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU, nullptr);
         }
-        if (!backend) {
+        if (!backend && !omni::flow::token2wav_require_npu()) {
             backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
         }
         std::fprintf(stderr, "voc_hg2_model: init_backend device=%s, gpu_idx=%d, backend=%s\n",
@@ -7207,7 +7208,7 @@ ggml_backend_t flow_loader_init_backend_gpu_first(std::string & backend_name_out
     if (!backend) {
         backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU, nullptr);
     }
-    if (!backend) {
+    if (!backend && !token2wav_require_npu()) {
         backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     }
     if (backend) {
@@ -7259,7 +7260,7 @@ bool flowGGUFModelLoader::init_backend(const std::string & device) {
             backend_ = ggml_backend_cann_init(gpu_idx);
         }
 #endif
-        if (!backend_) {
+        if (!backend_ && !token2wav_require_npu()) {
             backend_ = flow_loader_init_backend_gpu_first(backend_name_);
         }
         if (backend_) {
@@ -8728,11 +8729,11 @@ bool Token2Mel::load_model(const std::string & encoder_gguf,
                            const std::string & device,
                            int                 threads,
                            const std::string & coreml_model_path) {
-    // 用于加载三段GGUF并初始化runner(失败时回退到cpu)
+    // 用于加载三段GGUF并初始化runner；strict NPU mode 不允许回退到 CPU。
     reset_stream();
     runner_.set_num_threads(threads);
     if (!runner_.load_from_gguf(encoder_gguf, flow_matching_gguf, flow_extra_gguf, device)) {
-        if (device != "cpu") {
+        if (device != "cpu" && !token2wav_require_npu()) {
             LOG_ERROR( "Token2Mel.load_model: load_from_gguf(%s) failed, fallback to cpu\n", device.c_str());
             if (!runner_.load_from_gguf(encoder_gguf, flow_matching_gguf, flow_extra_gguf, "cpu")) {
                 LOG_ERROR( "Token2Mel.load_model: fallback cpu failed\n");
@@ -9678,6 +9679,29 @@ bool Token2Wav::load_models(const std::string & encoder_gguf,
                             const std::string & coreml_model_path) {
     reset_stream();
 
+    const bool require_npu = token2wav_require_npu();
+    if (require_npu) {
+#ifndef GGML_USE_CANN
+        LOG_ERROR("Token2Wav.load_models: OMNI_REQUIRE_NPU_T2W=1 requires a CANN build\n");
+        models_loaded_ = false;
+        return false;
+#else
+        if (!token2wav_accelerator_device_requested(device_token2mel) ||
+            !token2wav_accelerator_device_requested(device_vocoder)) {
+            LOG_ERROR("Token2Wav.load_models: strict NPU mode requires gpu[:index] for Token2Mel and vocoder "
+                      "(got token2mel=%s, vocoder=%s)\n",
+                      device_token2mel.c_str(), device_vocoder.c_str());
+            models_loaded_ = false;
+            return false;
+        }
+        if (!coreml_model_path.empty()) {
+            LOG_ERROR("Token2Wav.load_models: strict NPU mode rejects the CoreML Token2Mel path\n");
+            models_loaded_ = false;
+            return false;
+        }
+#endif
+    }
+
     // CPU thread count for token2mel / vocoder. Overridable via env
     // OMNI_T2W_THREADS: on many-core servers the vocoder-on-CPU path
     // benefits from far more than 8 threads. Only affects CPU backends.
@@ -9698,8 +9722,33 @@ bool Token2Wav::load_models(const std::string & encoder_gguf,
         models_loaded_ = false;
         return false;
     }
+    if (require_npu &&
+        (!token2wav_backend_name_is_cann(t2m_.backend_name())
+#ifdef GGML_USE_CANN
+         || !ggml_backend_is_cann(t2m_.backend())
+#endif
+        )) {
+        LOG_ERROR("Token2Wav.load_models: strict NPU mode rejected Token2Mel backend=%s\n",
+                  t2m_.backend_name().c_str());
+        models_loaded_ = false;
+        return false;
+    }
     if (!voc_model_.voc_hg2_model_init_from_gguf(vocoder_gguf, device_vocoder, kDefaultThreads)) {
         LOG_ERROR( "Token2Wav.load_models: voc_hg2_model_init_from_gguf failed\n");
+        models_loaded_ = false;
+        return false;
+    }
+    const std::string vocoder_backend_name =
+        voc_model_.backend ? ggml_backend_name(voc_model_.backend) : std::string();
+    if (require_npu &&
+        (!token2wav_backend_name_is_cann(vocoder_backend_name)
+#ifdef GGML_USE_CANN
+         || !ggml_backend_is_cann(voc_model_.backend)
+#endif
+        )) {
+        LOG_ERROR("Token2Wav.load_models: strict NPU mode rejected vocoder backend=%s\n",
+                  vocoder_backend_name.empty() ? "null" : vocoder_backend_name.c_str());
+        voc_model_.voc_hg2_model_free();
         models_loaded_ = false;
         return false;
     }

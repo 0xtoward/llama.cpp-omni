@@ -21,6 +21,7 @@ add_library(omni
             omni-impl.h
             token2wav/token2wav-impl.cpp
             token2wav/token2wav-impl.h
+            token2wav/token2wav-backend-policy.h
             token2wav/token2wav.cpp
             token2wav/token2wav.h
             token2wav/token2wav-profile.h
@@ -197,6 +198,15 @@ endif()
 # voxcpm2-cli build + smoke test (no weights). --help exits non-zero by design,
 # so assert on the usage banner instead of the exit code.
 if (LLAMA_BUILD_TESTS)
+    add_executable(test-token2wav-backend-policy test/test-token2wav-backend-policy.cpp)
+    target_include_directories(test-token2wav-backend-policy PRIVATE .)
+    target_compile_features(test-token2wav-backend-policy PRIVATE cxx_std_17)
+    add_test(
+        NAME token2wav-backend-policy
+        COMMAND test-token2wav-backend-policy
+    )
+    set_tests_properties(token2wav-backend-policy PROPERTIES LABELS "main;omni")
+
     add_test(
         NAME voxcpm2-cli-smoke
         COMMAND ${TARGET_VOXCPM2_CLI} --help

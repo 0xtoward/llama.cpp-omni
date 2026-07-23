@@ -1659,6 +1659,7 @@ class flowGGUFModelRunner {
                         const std::string & flow_extra_gguf_path,
                         const std::string & device);
     void set_num_threads(int n_threads);
+    ggml_backend_t backend() const { return loader_.backend(); }
     const std::string & backend_name() const { return loader_.backend_name(); }
     void set_export_caches_to_host(bool enable) { export_caches_to_host_ = enable; }
     void reset_stream();
@@ -2075,6 +2076,8 @@ class Token2Mel {
     void reset_stream();
 
     bool is_ane_mode() const { return backend_kind_ == Backend::ANE; }
+    ggml_backend_t backend() const { return runner_.backend(); }
+    const std::string & backend_name() const { return runner_.backend_name(); }
 
     static constexpr int32_t kMelChannels  = 80;
     static constexpr int32_t kSpkDim       = 192;
