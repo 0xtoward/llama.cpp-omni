@@ -2214,14 +2214,14 @@ ggml_backend_t fm_loader_init_backend_gpu_idx(int gpu_idx, std::string & backend
         backend = ggml_backend_cann_init(gpu_idx);
     }
 #endif
-    if (!backend && !token2wav_require_npu()) {
+    if (!backend && !omni::flow::token2wav_require_npu()) {
         // fallback to generic GPU init
         backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
     }
-    if (!backend && !token2wav_require_npu()) {
+    if (!backend && !omni::flow::token2wav_require_npu()) {
         backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU, nullptr);
     }
-    if (!backend && !token2wav_require_npu()) {
+    if (!backend && !omni::flow::token2wav_require_npu()) {
         backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     }
     if (backend) {
@@ -3199,13 +3199,13 @@ ggml_backend_t ue_loader_init_backend_gpu_idx(int gpu_idx, std::string & backend
         backend = ggml_backend_cann_init(gpu_idx);
     }
 #endif
-    if (!backend && !token2wav_require_npu()) {
+    if (!backend && !omni::flow::token2wav_require_npu()) {
         backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
     }
-    if (!backend && !token2wav_require_npu()) {
+    if (!backend && !omni::flow::token2wav_require_npu()) {
         backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU, nullptr);
     }
-    if (!backend && !token2wav_require_npu()) {
+    if (!backend && !omni::flow::token2wav_require_npu()) {
         backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     }
     if (backend) {
