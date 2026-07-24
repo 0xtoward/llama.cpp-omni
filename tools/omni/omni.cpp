@@ -5,6 +5,7 @@
 #include "token2wav/token2wav-impl.h"
 #include "token2wav/token2wav-backend-policy.h"
 #include "sampling-policy.h"
+#include "token-trace.h"
 #include "wav-chunk-utils.h"
 
 #include "llama.h"
@@ -251,6 +252,20 @@ static OmniTokenType get_token_type(struct omni_context * ctx, llama_token token
         return OmniTokenType::EOS;
     }
     return OmniTokenType::NORMAL;
+}
+
+static const char * token_type_name(OmniTokenType type) {
+    switch (type) {
+        case OmniTokenType::NORMAL:        return "NORMAL";
+        case OmniTokenType::SPEAK:         return "SPEAK";
+        case OmniTokenType::LISTEN:        return "LISTEN";
+        case OmniTokenType::CHUNK_EOS:     return "CHUNK_EOS";
+        case OmniTokenType::CHUNK_TTS_EOS: return "CHUNK_TTS_EOS";
+        case OmniTokenType::TURN_EOS:      return "TURN_EOS";
+        case OmniTokenType::TTS_EOS:       return "TTS_EOS";
+        case OmniTokenType::EOS:           return "EOS";
+    }
+    return "UNKNOWN";
 }
 
 // 检查是否是会话/轮次结束 token
@@ -1366,8 +1381,12 @@ static const char * sample_with_hidden_and_token(struct common_sampler * smpl, s
     // Raw logits are deliberately not copied to Host while backend sampling is
     // active. Mutating llama_get_logits_ith() in that mode edits stale storage
     // after the device has already selected the token.
+    const bool trace_enabled = ctx_omni->token_trace.enabled();
+    float * raw_logits = nullptr;
+    std::vector<omni::token_trace::top_k_entry> top_k;
+    llama_token greedy_token = LLAMA_TOKEN_NULL;
     if (!ctx_omni->backend_sampling_active) {
-        float * logits = llama_get_logits_ith(ctx_omni->ctx_llama, -1);
+        raw_logits = llama_get_logits_ith(ctx_omni->ctx_llama, -1);
         const llama_vocab * vocab =
             llama_model_get_vocab(llama_get_model(ctx_omni->ctx_llama));
         const omni_sampling_policy policy = {
@@ -1380,25 +1399,122 @@ static const char * sample_with_hidden_and_token(struct common_sampler * smpl, s
             ctx_omni->special_token_tts_eos,
         };
         omni_apply_host_sampling_policy(
-            logits,
+            raw_logits,
             static_cast<size_t>(llama_vocab_n_tokens(vocab)),
             policy);
+        if (trace_enabled) {
+            top_k = omni::token_trace::compute_top_k(
+                raw_logits,
+                static_cast<size_t>(llama_vocab_n_tokens(vocab)),
+                5);
+            if (!top_k.empty()) {
+                greedy_token = top_k.front().token;
+            }
+        }
     }
     
-    const llama_token id = sample_token(smpl, ctx_omni);
-    if (id == LLAMA_TOKEN_NULL) {
+    const llama_token sampled_id = sample_token(smpl, ctx_omni);
+    if (sampled_id == LLAMA_TOKEN_NULL) {
         LOG_ERR("backend sampler did not produce a token for hidden-state decode\n");
         return nullptr;
     }
-    token_id = id;  // 保存token ID
-    common_sampler_accept(smpl, id, true);
+    if (ctx_omni->backend_sampling_active) {
+        greedy_token = sampled_id;
+    }
+
+    llama_token selected_id = sampled_id;
+    bool teacher_active = false;
+    size_t teacher_index = 0;
+    uint64_t trace_step = 0;
+    uint64_t session_generation = 0;
+    int prompt_token_count = 0;
+    int request_prefill_token_count = 0;
+    if (trace_enabled) {
+        std::lock_guard<std::mutex> lock(ctx_omni->token_trace_mtx);
+        trace_step = ctx_omni->token_trace.step++;
+        session_generation =
+            ctx_omni->token_trace.session_generation;
+        prompt_token_count =
+            ctx_omni->token_trace.prompt_token_count;
+        request_prefill_token_count =
+            ctx_omni->token_trace.request_prefill_token_count;
+        teacher_active = ctx_omni->token_trace.teacher_enabled();
+        if (teacher_active) {
+            std::string error;
+            int32_t teacher_token = -1;
+            if (!omni::token_trace::next_teacher_token(
+                    ctx_omni->token_trace,
+                    teacher_token,
+                    teacher_index,
+                    error)) {
+                LOG_ERR("OMNI_TEACHER_TOKENS_FILE: %s\n", error.c_str());
+                return nullptr;
+            }
+            const int32_t n_vocab = llama_vocab_n_tokens(
+                llama_model_get_vocab(llama_get_model(ctx_omni->ctx_llama)));
+            if (teacher_token < 0 || teacher_token >= n_vocab) {
+                LOG_ERR("OMNI_TEACHER_TOKENS_FILE token %d at index %zu "
+                        "is outside vocabulary [0, %d)\n",
+                        teacher_token, teacher_index, n_vocab);
+                return nullptr;
+            }
+            selected_id = teacher_token;
+        }
+    }
+
+    token_id = selected_id;
+    common_sampler_accept(smpl, selected_id, true);
     static std::string ret;
-    if (llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx_omni->ctx_llama)), id)) {
+    if (llama_vocab_is_eog(
+            llama_model_get_vocab(llama_get_model(ctx_omni->ctx_llama)),
+            selected_id)) {
         ret = "</s>";
     } else {
-        ret = common_token_to_piece(ctx_omni->ctx_llama, id);
+        ret = common_token_to_piece(ctx_omni->ctx_llama, selected_id);
     }
-    eval_id_with_hidden(ctx_omni, params, id, n_past, hidden_states);
+
+    const int n_past_before = *n_past;
+    const bool eval_ok =
+        eval_id_with_hidden(ctx_omni, params, selected_id, n_past, hidden_states);
+    if (trace_enabled) {
+        const int n_embd =
+            llama_model_n_embd(llama_get_model(ctx_omni->ctx_llama));
+        omni::token_trace::record event;
+        event.step = trace_step;
+        event.position = n_past_before;
+        event.n_past_before = n_past_before;
+        event.n_past_after = *n_past;
+        event.turn_id = ctx_omni->current_turn_id;
+        event.session_generation = session_generation;
+        event.prompt_token_count = prompt_token_count;
+        event.request_prefill_token_count = request_prefill_token_count;
+        event.session_hint = ctx_omni->base_output_dir;
+        event.greedy_token = greedy_token;
+        event.sampled_token = sampled_id;
+        event.selected_token = selected_id;
+        event.token_type = token_type_name(get_token_type(ctx_omni, selected_id));
+        event.teacher_active = teacher_active;
+        event.teacher_index = teacher_index;
+        event.raw_logits_available = raw_logits != nullptr;
+        event.top_k = std::move(top_k);
+        event.hidden_available = hidden_states != nullptr;
+        if (event.hidden_available) {
+            event.hidden =
+                omni::token_trace::fingerprint(hidden_states, n_embd);
+        }
+
+        std::string error;
+        std::lock_guard<std::mutex> lock(ctx_omni->token_trace_mtx);
+        if (!omni::token_trace::append_jsonl(
+                ctx_omni->token_trace, event, error)) {
+            LOG_ERR("OMNI_TOKEN_TRACE: %s\n", error.c_str());
+            return nullptr;
+        }
+        if (!eval_ok) {
+            LOG_ERR("OMNI_TOKEN_TRACE: teacher/selected token eval failed\n");
+            return nullptr;
+        }
+    }
     return ret.c_str();
 }
 
@@ -4037,6 +4153,24 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
     // }
     // auto ctx_omni = (struct omni_context *)malloc(sizeof(omni_context));
     auto ctx_omni = new omni_context();
+
+    {
+        std::string error;
+        if (!omni::token_trace::initialize(
+                std::getenv("OMNI_TOKEN_TRACE"),
+                std::getenv("OMNI_TEACHER_TOKENS_FILE"),
+                ctx_omni->token_trace,
+                error)) {
+            LOG_ERR("token trace initialization failed: %s\n", error.c_str());
+            delete ctx_omni;
+            return nullptr;
+        }
+        if (ctx_omni->token_trace.enabled()) {
+            LOG_INF("OMNI_TOKEN_TRACE active: path=%s teacher_tokens=%zu\n",
+                    ctx_omni->token_trace.trace_path.c_str(),
+                    ctx_omni->token_trace.teacher_tokens.size());
+        }
+    }
 
     ctx_omni->params = params;
     ctx_omni->media_type = media_type;
@@ -9904,6 +10038,12 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
 
     // decode 开始时的 cache 长度（prefill 已完成写入，这里取值才准确）
     int decode_start_cache_len = ctx_omni->n_past;
+    if (ctx_omni->token_trace.enabled()) {
+        std::lock_guard<std::mutex> trace_lock(ctx_omni->token_trace_mtx);
+        ctx_omni->token_trace.prompt_token_count = decode_start_cache_len;
+        ctx_omni->token_trace.request_prefill_token_count =
+            std::max(0, decode_start_cache_len - ctx_omni->n_keep);
+    }
 
     // ---- force_listen：会话开局强制 LISTEN N 次 ----
     if (ctx_omni->force_listen_used < ctx_omni->force_listen_count) {
@@ -10506,6 +10646,14 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
         
         // 标记系统 prompt 已初始化
         ctx_omni->system_prompt_initialized = true;
+        if (ctx_omni->token_trace.enabled()) {
+            std::lock_guard<std::mutex> trace_lock(ctx_omni->token_trace_mtx);
+            ctx_omni->token_trace.session_generation++;
+            ctx_omni->token_trace.teacher_index = 0;
+            ctx_omni->token_trace.step = 0;
+            ctx_omni->token_trace.prompt_token_count = 0;
+            ctx_omni->token_trace.request_prefill_token_count = 0;
+        }
 
         //把这步完成再开llm线程以防冲突
         ctx_omni->n_keep = ctx_omni->n_past;
@@ -10888,7 +11036,17 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
             eval_string(ctx_omni, ctx_omni->params, prompt.c_str(), ctx_omni->params->n_batch, &ctx_omni->n_past, false);
         }
     }
-    LOG_INF("<user>%s\n", ctx_omni->params->prompt.c_str());
+    if (ctx_omni->token_trace.enabled()) {
+        std::lock_guard<std::mutex> trace_lock(ctx_omni->token_trace_mtx);
+        ctx_omni->token_trace.prompt_token_count = ctx_omni->n_past;
+        ctx_omni->token_trace.request_prefill_token_count =
+            std::max(0, decode_start_cache_len - ctx_omni->n_keep);
+    }
+    // The WebSocket turn payload is committed through omni_embeds::user_text,
+    // not common_params::prompt. Logging params->prompt here falsely rendered
+    // every WS request as an empty user message even when its tokens were in KV.
+    LOG_INF("<user prompt committed to KV at decode_start_cache_len=%d>\n",
+            decode_start_cache_len);
     LOG_INF("<assistant>");
     const int max_tgt_len = ctx_omni->params->n_predict < 0 ? ctx_omni->params->n_ctx : ctx_omni->params->n_predict;
     print_with_timestamp("LLM decode: max_tgt_len = %d, n_predict = %d, n_ctx = %d\n", 

@@ -226,6 +226,15 @@ if (LLAMA_BUILD_TESTS)
     )
     set_tests_properties(omni-sampling-policy PROPERTIES LABELS "main;omni")
 
+    add_executable(test-omni-token-trace test/test-token-trace.cpp)
+    target_include_directories(test-omni-token-trace PRIVATE .)
+    target_compile_features(test-omni-token-trace PRIVATE cxx_std_17)
+    add_test(
+        NAME omni-token-trace
+        COMMAND test-omni-token-trace
+    )
+    set_tests_properties(omni-token-trace PROPERTIES LABELS "main;omni")
+
     add_test(
         NAME voxcpm2-cli-smoke
         COMMAND ${TARGET_VOXCPM2_CLI} --help

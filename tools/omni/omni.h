@@ -13,6 +13,8 @@
 #include <functional>
 #include <atomic>
 
+#include "token-trace.h"
+
 // Windows compatibility: pid_t is not defined on MSVC
 #ifdef _WIN32
     typedef int pid_t;
@@ -167,6 +169,8 @@ struct omni_context {
     struct common_sampler * ctx_sampler = NULL;
     struct llama_sampler * backend_sampler_chain = NULL;
     bool backend_sampling_active = false;
+    omni::token_trace::state token_trace;
+    std::mutex token_trace_mtx;
     
     // 🔧 [单双工适配] 是否拥有模型（用于 omni_free 时决定是否释放模型）
     // true: omni_init 内部加载的模型，omni_free 时需要释放
