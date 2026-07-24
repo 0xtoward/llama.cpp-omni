@@ -112,6 +112,7 @@ struct llama_context {
 
     void set_embeddings (bool value);
     void set_embeddings_device_only(bool value);
+    void set_logits_device_only(bool value);
     void set_embeddings_pre_norm(bool value, bool masked);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
@@ -287,6 +288,11 @@ private:
     // When true, t_embd remains a graph output on its backend but decode does
     // not copy it to the host-side embd buffer.
     bool embeddings_device_only = false;
+
+    // When true, decode does not copy t_logits into the host-side logits
+    // buffer. Device-side auxiliary heads may still consume other graph
+    // outputs, such as the final embedding row.
+    bool logits_device_only = false;
 
     // Borrowed single-row view into the most recent device embedding output.
     // Its storage belongs to the graph tensor and remains valid only until the

@@ -1186,6 +1186,11 @@ void llama_context::set_embeddings_device_only(bool value) {
     }
 }
 
+void llama_context::set_logits_device_only(bool value) {
+    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+    logits_device_only = value;
+}
+
 void llama_context::set_embeddings_pre_norm(bool value, bool masked) {
     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
 
@@ -1919,7 +1924,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         // extract logits
-        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+        if (!logits_device_only && logits.data && t_logits && n_outputs > 0 &&
+            needs_raw_logits(ubatch, sampling.samplers)) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
@@ -3637,6 +3643,10 @@ void llama_set_embeddings(llama_context * ctx, bool embeddings) {
 
 void llama_set_embeddings_device_only(llama_context * ctx, bool value) {
     ctx->set_embeddings_device_only(value);
+}
+
+void llama_set_logits_device_only(llama_context * ctx, bool value) {
+    ctx->set_logits_device_only(value);
 }
 
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {

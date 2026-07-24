@@ -120,6 +120,12 @@ struct llama_device_tensor {
 // nullptr while this mode is active.
 LLAMA_API void llama_set_embeddings_device_only(struct llama_context * ctx, bool value);
 
+// Keep raw model logits on the execution backend and suppress the automatic
+// host-side logits copy. This is intended for auxiliary device heads that
+// consume a device embedding instead of the model's vocabulary logits.
+// Host logits getters must not be used while this mode is active.
+LLAMA_API void llama_set_logits_device_only(struct llama_context * ctx, bool value);
+
 // Return a borrowed handle for one row of the latest device embedding output.
 // The returned metadata view and its graph-owned storage are valid only until
 // the context executes another graph. Passing -1 selects the final live row.

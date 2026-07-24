@@ -10567,7 +10567,13 @@ bool Token2Wav::push_tokens_window(const int32_t *      tokens,
     const bool                  is_first = (cid == 0);
     omni::e2e_trace::context trace_context =
         omni::e2e_trace::current_context();
-    trace_context.chunk_id = cid;
+    // Preserve the ingress/TTS chunk identity so cross-stage E2E joins use
+    // one request clock and one key. Standalone Token2wav replay has no
+    // upstream identity, so retain the local monotonically increasing id
+    // there for useful component traces.
+    if (trace_context.chunk_id == 0) {
+        trace_context.chunk_id = cid;
+    }
     omni::e2e_trace::context_scope trace_scope(std::move(trace_context));
 
     std::vector<float> mel_bct;

@@ -4588,6 +4588,7 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         ctx_omni->ctx_tts_sampler = tts_sampler;
         if (ctx_omni->tts_device_head_enabled) {
             llama_set_embeddings_device_only(ctx_tts_llama, true);
+            llama_set_logits_device_only(ctx_tts_llama, true);
         }
         
         // Load TTS weights from GGUF file
