@@ -204,6 +204,7 @@ struct whisper_kv_cache {
     int n_layer = 0;   // number of layers
     int size = 0;      // fixed cache size (n_audio_ctx, e.g., 1500)
     int iter = 0;      // current iteration count for streaming
+    int n_tokens = 0;  // exact cached-token count; chunk lengths may vary
 };
 
 struct audition_ctx {
@@ -400,9 +401,7 @@ struct audition_graph {
             // calculate iter loop
             auto & kv_cache = ctx->whisper_kv_cache;
             const int n_audio_ctx = hparams.n_ctx;  // 1500
-            const int n_iter = n_audio_ctx / n_tokens;  // 1500 / 50 = 30
-
-            const int effective_iter = kv_cache.buffer != nullptr ? kv_cache.iter : 0;
+            const int cached_tokens = kv_cache.buffer != nullptr ? kv_cache.n_tokens : 0;
             
             // LOG_INF("%s: Position encoding - n_tokens=%d, n_audio_ctx=%d, n_iter=%d, effective_iter=%d\n",
             //         __func__, n_tokens, n_audio_ctx, n_iter, effective_iter);
@@ -416,20 +415,20 @@ struct audition_graph {
             // If effective_iter exceeds the buffer capacity, use modulo to wrap around
             // or reset KV cache if it's too large
             size_t e_pe_offset;
-            if (effective_iter >= n_iter) {
+            if (cached_tokens + n_tokens > n_audio_ctx) {
                 // Position encoding buffer is exhausted, reset KV cache
-                LOG_WRN("%s: Position encoding buffer exhausted (effective_iter=%d >= n_iter=%d), resetting KV cache\n",
-                        __func__, effective_iter, n_iter);
+                LOG_WRN("%s: Position encoding buffer exhausted (cached=%d + current=%d > max=%d), resetting KV cache\n",
+                        __func__, cached_tokens, n_tokens, n_audio_ctx);
                 audition_whisper_clear_kv_cache(ctx);
                 e_pe_offset = 0;  // Use offset 0 after reset
             } else {
-                e_pe_offset = model.whisper_e_pe->ne[0] * ggml_element_size(model.whisper_e_pe) * n_tokens * effective_iter;
+                e_pe_offset = model.whisper_e_pe->ne[0] * ggml_element_size(model.whisper_e_pe) * cached_tokens;
             }
             
             // Final bounds check for position encoding view
             if (e_pe_offset + e_pe_view_bytes > e_pe_total_bytes) {
                 LOG_ERR("%s: FATAL - Position encoding view would overflow! offset=%zu, view_size=%zu, total_size=%zu, effective_iter=%d\n",
-                        __func__, e_pe_offset, e_pe_view_bytes, e_pe_total_bytes, effective_iter);
+                        __func__, e_pe_offset, e_pe_view_bytes, e_pe_total_bytes, kv_cache.iter);
                 throw std::runtime_error("Position encoding buffer overflow - view exceeds bounds");
             }
             
@@ -485,7 +484,7 @@ struct audition_graph {
                 if (kv_cache.buffer != nullptr) {
                     // Calculate bounds checking
                     const int tokens_to_write = n_tokens;
-                    const int current_total_tokens = kv_cache.iter * n_tokens;
+                    const int current_total_tokens = kv_cache.n_tokens;
                     const int new_total_tokens = current_total_tokens + tokens_to_write;
                     const int max_tokens = kv_cache.size; // n_audio_ctx (1500)
                     
@@ -508,7 +507,7 @@ struct audition_graph {
                         throw std::runtime_error("KV cache buffer overflow - not enough space");
                     }
                     
-                    const size_t k_offset_bytes = ggml_row_size(kv_cache.k_l[il]->type, n_state) * (kv_cache.iter * n_tokens);
+                    const size_t k_offset_bytes = ggml_row_size(kv_cache.k_l[il]->type, n_state) * kv_cache.n_tokens;
                     const size_t k_total_bytes = ggml_row_size(kv_cache.k_l[il]->type, n_state) * tokens_to_write;
                     const size_t k_cache_total_bytes = ggml_nbytes(kv_cache.k_l[il]);
                     
@@ -537,7 +536,7 @@ struct audition_graph {
                     if (!v_trans) {
                         throw std::runtime_error("non-transposed V cache not supported");
                     } else {
-                        const size_t v_offset_bytes = kv_cache.iter * n_tokens * ggml_element_size(kv_cache.v_l[il]);
+                        const size_t v_offset_bytes = kv_cache.n_tokens * ggml_element_size(kv_cache.v_l[il]);
                         const size_t v_row_size = kv_cache.size * ggml_element_size(kv_cache.v_l[il]);
                         const size_t v_cache_total_bytes = ggml_nbytes(kv_cache.v_l[il]);
                         
@@ -569,8 +568,8 @@ struct audition_graph {
                 
                 if (kv_cache.buffer != nullptr) {
                     // KV cache initialized, create views for all history
-                    // iter not increased yet, so total_tokens = n_tokens * (iter + 1)
-                    const int total_tokens = n_tokens * (kv_cache.iter + 1);
+                    // n_tokens is increased only after graph execution.
+                    const int total_tokens = kv_cache.n_tokens + n_tokens;
                     const int max_tokens = kv_cache.size;
                     
                     // LOG_INF("%s: Layer %d - KV cache read: iter=%d, n_tokens=%d, total_tokens=%d, max_tokens=%d\n",
@@ -1526,7 +1525,7 @@ bool audition_audio_batch_encode(audition_ctx * ctx, const int n_threads, const 
         const int input_frames = audios.entries[0]->nx;
         const int n_tokens = input_frames / 2; // After conv2 with stride=2
         
-        const int current_total_tokens = ctx->whisper_kv_cache.iter * n_tokens;
+        const int current_total_tokens = ctx->whisper_kv_cache.n_tokens;
         const int new_total_tokens = current_total_tokens + n_tokens;
         const int max_tokens = ctx->whisper_kv_cache.size;
         
@@ -1539,9 +1538,9 @@ bool audition_audio_batch_encode(audition_ctx * ctx, const int n_threads, const 
             // Clear cache and reset iter instead of crashing
             LOG_WRN("%s: Clearing KV cache and resetting iter to prevent overflow\n", __func__);
             audition_whisper_clear_kv_cache(ctx);
-            ctx->whisper_kv_cache.iter = 0;
         } else {
             ctx->whisper_kv_cache.iter++;
+            ctx->whisper_kv_cache.n_tokens = new_total_tokens;
             LOG_INF("%s: KV cache iter incremented to %d (total_tokens=%d, max_tokens=%d)\n", 
                     __func__, ctx->whisper_kv_cache.iter, new_total_tokens, max_tokens);
         }
@@ -1611,6 +1610,7 @@ void audition_whisper_init_kv_cache(struct audition_ctx * ctx, int n_state, int 
     kv_cache.n_layer = n_layer;
     kv_cache.size = n_audio_ctx;
     kv_cache.iter = 0;
+    kv_cache.n_tokens = 0;
     
     // Create ggml context for KV cache tensors
     struct ggml_init_params params = {
@@ -1679,6 +1679,7 @@ void audition_whisper_free_kv_cache(struct audition_ctx * ctx) {
     kv_cache.n_layer = 0;
     kv_cache.size = 0;
     kv_cache.iter = 0;
+    kv_cache.n_tokens = 0;
     
     LOG_INF("%s: KV cache freed\n", __func__);
 }
@@ -1691,6 +1692,7 @@ void audition_whisper_clear_kv_cache(struct audition_ctx * ctx) {
     }
     
     kv_cache.iter = 0;
+    kv_cache.n_tokens = 0;
     
     LOG_INF("%s: KV cache cleared\n", __func__);
 }

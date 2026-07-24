@@ -11548,6 +11548,12 @@ bool omni_duplex_session_begin(struct omni_context * ctx_omni,
         LOG_ERR("omni_duplex_session_begin: stream_prefill(voice_audio, idx=0) failed\n");
         return false;
     }
+    // The reference voice embedding is already committed to the LLM prompt.
+    // Live chunks need a fresh APM timeline rather than attending to the
+    // reference-audio encoder cache.
+    if (ctx_omni->ctx_audio) {
+        audition_whisper_clear_kv_cache(ctx_omni->ctx_audio);
+    }
 
     // 2. 创建 session 并启动 worker 线程
     auto * sess = new DuplexSession();
@@ -11654,6 +11660,9 @@ void omni_duplex_session_end(struct omni_context * ctx_omni) {
 
     delete sess;
     ctx_omni->duplex_session = nullptr;
+    if (ctx_omni->ctx_audio) {
+        audition_whisper_clear_kv_cache(ctx_omni->ctx_audio);
+    }
     print_with_timestamp("omni_duplex_session_end: session destroyed\n");
 }
 
