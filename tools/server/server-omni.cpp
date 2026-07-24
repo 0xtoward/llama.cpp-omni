@@ -114,29 +114,43 @@ int main(int argc, char ** argv) {
     }
 
     // HTTP server setup
+    std::unique_ptr<httplib::Server> svr;
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
-    httplib::SSLServer svr(params.ssl_file_cert.c_str(), params.ssl_file_key.c_str());
+    if (!params.ssl_file_key.empty() && !params.ssl_file_cert.empty()) {
+        LOG_INF("Running with SSL: key = %s, cert = %s\n",
+                params.ssl_file_key.c_str(), params.ssl_file_cert.c_str());
+        svr.reset(new httplib::SSLServer(
+            params.ssl_file_cert.c_str(), params.ssl_file_key.c_str()));
+    } else {
+        LOG_INF("Running without SSL\n");
+        svr.reset(new httplib::Server());
+    }
 #else
-    httplib::Server svr;
+    if (!params.ssl_file_key.empty() || !params.ssl_file_cert.empty()) {
+        LOG_ERR("Server is built without SSL support\n");
+        llama_backend_free();
+        return 1;
+    }
+    svr.reset(new httplib::Server());
 #endif
 
     omni_server_state state;
 
     // GET /health
-    svr.Get("/health", [&](const httplib::Request &, httplib::Response & res) {
+    svr->Get("/health", [&](const httplib::Request &, httplib::Response & res) {
         json health = {{"status", "ok"}, {"engine", "comni"}};
         res.set_header("X-Engine", "comni");
         res_ok(res, health);
     });
 
-    svr.Get("/v1/health", [&](const httplib::Request &, httplib::Response & res) {
+    svr->Get("/v1/health", [&](const httplib::Request &, httplib::Response & res) {
         json health = {{"status", "ok"}, {"engine", "comni"}};
         res.set_header("X-Engine", "comni");
         res_ok(res, health);
     });
 
     // POST /v1/stream/omni_init
-    svr.Post("/v1/stream/omni_init", [&](const httplib::Request & req, httplib::Response & res) {
+    svr->Post("/v1/stream/omni_init", [&](const httplib::Request & req, httplib::Response & res) {
         json data = json::parse(req.body);
 
         if (!data.contains("msg_type") && !data.contains("media_type")) {
@@ -207,7 +221,7 @@ int main(int argc, char ** argv) {
     });
 
     // POST /v1/stream/prefill
-    svr.Post("/v1/stream/prefill", [&](const httplib::Request & req, httplib::Response & res) {
+    svr->Post("/v1/stream/prefill", [&](const httplib::Request & req, httplib::Response & res) {
         json data = json::parse(req.body);
 
         if (!data.contains("audio_path_prefix") || !data.at("audio_path_prefix").is_string()) {
@@ -248,7 +262,7 @@ int main(int argc, char ** argv) {
     });
 
     // POST /v1/stream/decode (SSE)
-    svr.Post("/v1/stream/decode", [&](const httplib::Request & req, httplib::Response & res) {
+    svr->Post("/v1/stream/decode", [&](const httplib::Request & req, httplib::Response & res) {
         json data = json::parse(req.body);
 
         {
@@ -344,7 +358,7 @@ int main(int argc, char ** argv) {
     });
 
     // POST /v1/stream/update_session_config
-    svr.Post("/v1/stream/update_session_config", [&](const httplib::Request & req, httplib::Response & res) {
+    svr->Post("/v1/stream/update_session_config", [&](const httplib::Request & req, httplib::Response & res) {
         json data = json::parse(req.body);
         int media_type = data.value("media_type", -1);
 
@@ -365,13 +379,13 @@ int main(int argc, char ** argv) {
     //
     // Backend Protocol (WebSocket + HTTP unary)
     //
-    svr.WebSocket("/backend", [&](const httplib::Request &, httplib::ws::WebSocket & ws) {
+    svr->WebSocket("/backend", [&](const httplib::Request &, httplib::ws::WebSocket & ws) {
         handle_ws_backend(ws, state.session_mgr, params,
                           /*model*/nullptr, /*ctx*/nullptr,
                           state.octx, state.octx_mutex);
     });
 
-    svr.Post("/sessions/:session_id/close", [&](const httplib::Request & req, httplib::Response & res) {
+    svr->Post("/sessions/:session_id/close", [&](const httplib::Request & req, httplib::Response & res) {
         std::string session_id = req.path_params.at("session_id");
         LOG_INF("Close session requested: %s\n", session_id.c_str());
 
@@ -411,7 +425,7 @@ int main(int argc, char ** argv) {
     });
 
     // start server
-    if (!svr.listen("0.0.0.0", params.port)) {
+    if (!svr->listen("0.0.0.0", params.port)) {
         LOG_ERR("Omni HTTP server failed to listen on 0.0.0.0:%d\n", params.port);
         llama_backend_free();
         return 1;
