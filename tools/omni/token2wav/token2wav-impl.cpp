@@ -6734,26 +6734,34 @@ struct voc_hg2_runner::persistent_state {
     using key = omni::flow::hift_plan_key;
 
     struct plan {
-        key             cache_key{};
-        ggml_context *  ctx = nullptr;
-        ggml_gallocr_t  galloc = nullptr;
-        ggml_cgraph *   graph = nullptr;
-        ggml_tensor *   speech_upload_tcb = nullptr;
-        ggml_tensor *   speech_feat_c80_t_b = nullptr;
-        ggml_tensor *   cache_source_t1_b = nullptr;
-        ggml_tensor *   cache_source_flat = nullptr;
-        ggml_tensor *   wave_t_b = nullptr;
-        ggml_tensor *   source_t1_b = nullptr;
-        ggml_tensor *   source_tail_flat = nullptr;
-        int64_t         source_tail_len = 0;
-        uint64_t        last_use = 0;
+        key                     cache_key{};
+        ggml_context *          input_ctx = nullptr;
+        ggml_backend_buffer_t   input_buffer = nullptr;
+        ggml_context *          compute_ctx = nullptr;
+        ggml_gallocr_t          galloc = nullptr;
+        ggml_cgraph *           graph = nullptr;
+        ggml_tensor *           speech_upload_tcb = nullptr;
+        ggml_tensor *           speech_feat_c80_t_b = nullptr;
+        ggml_tensor *           cache_source_t1_b = nullptr;
+        ggml_tensor *           cache_source_flat = nullptr;
+        ggml_tensor *           wave_t_b = nullptr;
+        ggml_tensor *           source_t1_b = nullptr;
+        ggml_tensor *           source_tail_flat = nullptr;
+        int64_t                 source_tail_len = 0;
+        uint64_t                last_use = 0;
 
         ~plan() {
             if (galloc) {
                 ggml_gallocr_free(galloc);
             }
-            if (ctx) {
-                ggml_free(ctx);
+            if (compute_ctx) {
+                ggml_free(compute_ctx);
+            }
+            if (input_buffer) {
+                ggml_backend_buffer_free(input_buffer);
+            }
+            if (input_ctx) {
+                ggml_free(input_ctx);
             }
         }
     };
@@ -6902,31 +6910,61 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
             auto plan = std::make_unique<plan_t>();
             plan->cache_key = cache_key;
 
-            ggml_init_params params{};
-            params.mem_size   = 2048ull * 1024ull * 1024ull;
-            params.mem_buffer = nullptr;
-            params.no_alloc   = true;
-            plan->ctx = ggml_init(params);
-            if (!plan->ctx) {
-                std::fprintf(stderr, "voc_hg2_runner: failed to create persistent HiFT context\n");
+            ggml_init_params input_params{};
+            input_params.mem_size   = 16 * ggml_tensor_overhead();
+            input_params.mem_buffer = nullptr;
+            input_params.no_alloc   = true;
+            plan->input_ctx = ggml_init(input_params);
+            if (!plan->input_ctx) {
+                std::fprintf(stderr, "voc_hg2_runner: failed to create persistent HiFT input context\n");
                 return false;
             }
 
             plan->speech_upload_tcb =
-                ggml_new_tensor_3d(plan->ctx, GGML_TYPE_F32, T_mel, C, B);
-            plan->speech_feat_c80_t_b =
-                ggml_cont(plan->ctx, ggml_permute(plan->ctx, plan->speech_upload_tcb, 1, 0, 2, 3));
+                ggml_new_tensor_3d(plan->input_ctx, GGML_TYPE_F32, T_mel, C, B);
             plan->cache_source_t1_b =
-                ggml_new_tensor_3d(plan->ctx, GGML_TYPE_F32, Tc, 1, B);
+                ggml_new_tensor_3d(plan->input_ctx, GGML_TYPE_F32, Tc, 1, B);
+            ggml_set_input(plan->speech_upload_tcb);
+            ggml_set_input(plan->cache_source_t1_b);
+            if (Tc > 0) {
+                plan->cache_source_flat =
+                    ggml_view_1d(plan->input_ctx, plan->cache_source_t1_b, Tc, 0);
+            }
+            plan->input_buffer =
+                ggml_backend_alloc_ctx_tensors(plan->input_ctx, model->backend);
+            if (!plan->input_buffer) {
+                std::fprintf(stderr, "voc_hg2_runner: failed to allocate persistent HiFT inputs\n");
+                return false;
+            }
+
+            ggml_init_params compute_params{};
+            compute_params.mem_size   = 2048ull * 1024ull * 1024ull;
+            compute_params.mem_buffer = nullptr;
+            compute_params.no_alloc   = true;
+            plan->compute_ctx = ggml_init(compute_params);
+            if (!plan->compute_ctx) {
+                std::fprintf(stderr, "voc_hg2_runner: failed to create persistent HiFT compute context\n");
+                return false;
+            }
+            plan->speech_feat_c80_t_b =
+                ggml_cont(
+                    plan->compute_ctx,
+                    ggml_permute(
+                        plan->compute_ctx,
+                        plan->speech_upload_tcb,
+                        1, 0, 2, 3));
             plan->graph =
-                ggml_new_graph_custom(plan->ctx, GGML_DEFAULT_GRAPH_SIZE * 256, false);
+                ggml_new_graph_custom(
+                    plan->compute_ctx,
+                    GGML_DEFAULT_GRAPH_SIZE * 256,
+                    false);
 
             {
                 omni::e2e_trace::span trace(
                     "hift", "build_alloc", ggml_backend_name(model->backend));
                 omni::flow::profile::ScopeTimer timer("voc.build_alloc");
                 if (!voc_hg2_runner_build_graph(
-                        plan->ctx,
+                        plan->compute_ctx,
                         plan->graph,
                         plan->speech_feat_c80_t_b,
                         plan->cache_source_t1_b,
@@ -6943,20 +6981,47 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
                 }
             }
 
-            if (Tc > 0) {
-                plan->cache_source_flat =
-                    ggml_view_1d(plan->ctx, plan->cache_source_t1_b, Tc, 0);
-                plan->cache_source_flat->buffer = plan->cache_source_t1_b->buffer;
-            }
             plan->source_tail_len =
                 std::min<int64_t>(kPersistentSourceCacheLen, plan->source_t1_b->ne[0]);
             plan->source_tail_flat = ggml_view_1d(
-                plan->ctx,
+                plan->compute_ctx,
                 plan->source_t1_b,
                 plan->source_tail_len,
                 static_cast<size_t>(plan->source_t1_b->ne[0] - plan->source_tail_len) *
                     plan->source_t1_b->nb[0]);
             plan->source_tail_flat->buffer = plan->source_t1_b->buffer;
+
+            const omni::flow::hift_buffer_span input_spans[] = {
+                {
+                    reinterpret_cast<uintptr_t>(plan->speech_upload_tcb->data),
+                    ggml_nbytes(plan->speech_upload_tcb),
+                },
+                {
+                    reinterpret_cast<uintptr_t>(plan->cache_source_t1_b->data),
+                    ggml_nbytes(plan->cache_source_t1_b),
+                },
+            };
+            const omni::flow::hift_buffer_span output_spans[] = {
+                {
+                    reinterpret_cast<uintptr_t>(plan->wave_t_b->data),
+                    ggml_nbytes(plan->wave_t_b),
+                },
+                {
+                    reinterpret_cast<uintptr_t>(plan->source_t1_b->data),
+                    ggml_nbytes(plan->source_t1_b),
+                },
+            };
+            for (const auto & input_span : input_spans) {
+                for (const auto & output_span : output_spans) {
+                    if (omni::flow::hift_buffer_spans_overlap(input_span, output_span)) {
+                        std::fprintf(
+                            stderr,
+                            "voc_hg2_runner: persistent HiFT input/output buffers overlap; "
+                            "refusing unsafe plan\n");
+                        return false;
+                    }
+                }
+            }
 
             {
                 omni::e2e_trace::span trace(
@@ -6986,6 +7051,40 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
 
         plan_t & plan = *found->second;
         plan.last_use = ++state.clock;
+
+        // Preserve the previous output before writing any new input. The
+        // source tail may belong to this same exact-shape plan on steady
+        // chunks, so this order is part of the persistent-state contract.
+        if (Tc > 0) {
+            omni::e2e_trace::span trace(
+                "hift", "source_cache_d2d", ggml_backend_name(model->backend));
+            omni::flow::profile::ScopeTimer timer("voc.source_cache.d2d");
+            if (state.active_source_plan &&
+                state.active_source_len == Tc &&
+                state.active_source_plan->source_tail_flat &&
+                plan.cache_source_flat) {
+                ggml_backend_tensor_copy(
+                    state.active_source_plan->source_tail_flat,
+                    plan.cache_source_flat);
+            } else if ((int64_t) cache_source_bt1.size() == Tc * B) {
+                // Compatibility bridge for entering persistent mode with an
+                // already-populated host cache. Normal persistent hot paths
+                // never take this branch.
+                hg_backend_tensor_set(
+                    model->backend,
+                    plan.cache_source_t1_b,
+                    cache_source_bt1.data(),
+                    cache_source_bt1.size() * sizeof(float));
+            } else {
+                std::fprintf(
+                    stderr,
+                    "voc_hg2_runner: persistent source cache unavailable "
+                    "(expected Tc=%lld, active=%lld); refusing host fallback\n",
+                    (long long) Tc,
+                    (long long) state.active_source_len);
+                return false;
+            }
+        }
 
         {
             omni::e2e_trace::span trace(
@@ -7019,37 +7118,6 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
                     reinterpret_cast<uintptr_t>(plan.speech_upload_tcb->data);
                 speech.reused = plan_cache_hit;
                 trace_state.append_tensor(speech);
-            }
-        }
-
-        if (Tc > 0) {
-            omni::e2e_trace::span trace(
-                "hift", "source_cache_d2d", ggml_backend_name(model->backend));
-            omni::flow::profile::ScopeTimer timer("voc.source_cache.d2d");
-            if (state.active_source_plan &&
-                state.active_source_len == Tc &&
-                state.active_source_plan->source_tail_flat &&
-                plan.cache_source_flat) {
-                ggml_backend_tensor_copy(
-                    state.active_source_plan->source_tail_flat,
-                    plan.cache_source_flat);
-            } else if ((int64_t) cache_source_bt1.size() == Tc * B) {
-                // Compatibility bridge for entering persistent mode with an
-                // already-populated host cache. Normal persistent hot paths
-                // never take this branch.
-                hg_backend_tensor_set(
-                    model->backend,
-                    plan.cache_source_t1_b,
-                    cache_source_bt1.data(),
-                    cache_source_bt1.size() * sizeof(float));
-            } else {
-                std::fprintf(
-                    stderr,
-                    "voc_hg2_runner: persistent source cache unavailable "
-                    "(expected Tc=%lld, active=%lld); refusing host fallback\n",
-                    (long long) Tc,
-                    (long long) state.active_source_len);
-                return false;
             }
         }
 

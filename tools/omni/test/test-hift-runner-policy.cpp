@@ -39,6 +39,14 @@ int main() {
         CHECK(!(steady == final));
         CHECK(hift_plan_key_hash{}(steady) != hift_plan_key_hash{}(final));
     }
+    {
+        const hift_buffer_span input{0x1000, 0x100};
+        CHECK(hift_buffer_spans_overlap(input, {0x1080, 0x20}));
+        CHECK(hift_buffer_spans_overlap({0x1080, 0x20}, input));
+        CHECK(!hift_buffer_spans_overlap(input, {0x1100, 0x20}));
+        CHECK(!hift_buffer_spans_overlap({0x0f00, 0x100}, input));
+        CHECK(!hift_buffer_spans_overlap(input, {0x1080, 0}));
+    }
 
     std::cout << "HiFT runner policy tests passed\n";
     return 0;

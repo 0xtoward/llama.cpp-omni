@@ -2,6 +2,7 @@
 
 #include <cerrno>
 #include <climits>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
@@ -39,6 +40,23 @@ struct hift_plan_key_hash {
         return hash;
     }
 };
+
+struct hift_buffer_span {
+    uintptr_t address = 0;
+    size_t    bytes = 0;
+};
+
+inline bool hift_buffer_spans_overlap(
+        hift_buffer_span lhs,
+        hift_buffer_span rhs) {
+    if (lhs.bytes == 0 || rhs.bytes == 0) {
+        return false;
+    }
+    if (lhs.address <= rhs.address) {
+        return rhs.address - lhs.address < lhs.bytes;
+    }
+    return lhs.address - rhs.address < rhs.bytes;
+}
 
 inline hift_plan_phase hift_plan_phase_for(bool is_final, int64_t tc) {
     return is_final ? hift_plan_phase::final
