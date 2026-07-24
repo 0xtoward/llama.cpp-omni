@@ -1729,6 +1729,7 @@ class flowGGUFModelRunner {
     struct streamSessionEncOnly;
     int  num_threads_           = 1;
     bool export_caches_to_host_ = true;
+    uint64_t graph_epoch_counter_ = 0;
     flowGGUFModelLoader            loader_;
     std::unique_ptr<streamSession>        sess_;
     std::unique_ptr<streamSessionEncOnly> sess_enc_only_;

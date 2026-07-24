@@ -14,6 +14,15 @@
 // These types are not exposed by the public ggml API; declare them locally
 typedef void (*ggml_backend_cuda_set_allow_batched_add_t)(ggml_backend_t backend, bool allow);
 typedef void (*ggml_backend_cuda_set_disable_graph_t)(ggml_backend_t backend, bool disable);
+typedef bool (*ggml_backend_cann_stage_exact_enabled_t)(ggml_backend_t backend, const char * stage);
+typedef void (*ggml_backend_cann_set_stage_exact_context_t)(
+    ggml_backend_t backend,
+    const char * domain,
+    uint64_t epoch,
+    bool allow_capture,
+    int64_t t_mel,
+    int64_t tc,
+    uintptr_t primary_address);
 #include "ggml.h"
 #include "gguf.h"
 #include <chrono>
@@ -98,6 +107,43 @@ static void omni_set_cuda_disable_graph(ggml_backend_t backend, bool disable) {
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_disable_graph");
     if (setter) {
         setter(backend, disable);
+    }
+}
+
+static ggml_backend_reg_t omni_backend_reg(ggml_backend_t backend) {
+    if (!backend) {
+        return nullptr;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    return dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+}
+
+static bool omni_cann_stage_exact_enabled(ggml_backend_t backend, const char * stage) {
+    ggml_backend_reg_t reg = omni_backend_reg(backend);
+    if (!reg) {
+        return false;
+    }
+    auto query = reinterpret_cast<ggml_backend_cann_stage_exact_enabled_t>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cann_stage_exact_enabled"));
+    return query && query(backend, stage);
+}
+
+static void omni_set_cann_stage_exact_context(
+        ggml_backend_t backend,
+        const char * domain,
+        uint64_t epoch,
+        bool allow_capture,
+        int64_t t_mel,
+        int64_t tc,
+        uintptr_t primary_address) {
+    ggml_backend_reg_t reg = omni_backend_reg(backend);
+    if (!reg) {
+        return;
+    }
+    auto setter = reinterpret_cast<ggml_backend_cann_set_stage_exact_context_t>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cann_set_stage_exact_context"));
+    if (setter) {
+        setter(backend, domain, epoch, allow_capture, t_mel, tc, primary_address);
     }
 }
 
@@ -6795,6 +6841,12 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
     }
     {
         omni::flow::profile::ScopeTimer _t("voc.compute");
+        // HiFT is observation-only in stage_exact v1: its dynamic T_mel/Tc
+        // and freshly allocated addresses are recorded, but it is never
+        // graph-eligible and is not restructured here.
+        omni_set_cann_stage_exact_context(
+            model->backend, "hift", /*epoch=*/0, /*allow_capture=*/false,
+            T_mel, Tc, reinterpret_cast<uintptr_t>(speech_upload_tcb->data));
         const ggml_status st = ggml_backend_graph_compute(model->backend, gf);
         if (st != GGML_STATUS_SUCCESS) {
             LOG_ERROR( "voc_hg2_runner_eval_stream: ggml_backend_graph_compute failed\n");
@@ -7574,6 +7626,7 @@ struct flowGGUFModelRunner::streamSession {
     int64_t T_chunk_token  = 0;
     int   n_timesteps = 0;
     float temperature = 1.0f;
+    uint64_t epoch = 0;
     ggml_tensor * prompt_token_ids_tb = nullptr;
     ggml_tensor * prompt_mel_ctb      = nullptr;
     ggml_tensor * spk_cb              = nullptr;
@@ -7852,6 +7905,9 @@ bool flowGGUFModelRunner::setup_cache(const int32_t *       token_bt,
             return false;
         }
     }
+    // setup_cache starts a new logical stream even when persistent tensor
+    // addresses are reused. Epoch is part of the CANN exact-graph cache key.
+    sess_->epoch = ++graph_epoch_counter_;
     std::vector<int32_t> token_tb;
     runner_bt_to_tb(token_bt, B, T_token, token_tb);
     std::vector<float> spk_cb;
@@ -7869,6 +7925,52 @@ bool flowGGUFModelRunner::setup_cache(const int32_t *       token_bt,
     const ggml_status st = ggml_backend_graph_compute(loader_.backend(), sess_->gf_setup);
     if (st != GGML_STATUS_SUCCESS) {
         return false;
+    }
+    if (omni_cann_stage_exact_enabled(loader_.backend(), "token2mel")) {
+        // The persistent non-last/last graphs already have stable allocations.
+        // Warm each graph eagerly, then capture it during initialization. The
+        // serving path below is lookup-only and is never allowed to capture.
+        const int32_t pad_token = 4218;
+        std::vector<int32_t> capture_tokens((size_t) sess_->T_chunk_token * (size_t) B, pad_token);
+        backend_tensor_set(loader_.backend(), sess_->chunk_token_ids_tb, capture_tokens.data(),
+                           capture_tokens.size() * sizeof(int32_t));
+        runner_feed_enc_stream_pos(loader_.backend(), sess_->ctx, loader_.encoder());
+
+        auto prepare_and_compute = [&](bool last, bool allow_capture) {
+            const int call_id = last ? sess_->call_id_last : sess_->call_id_nonlast;
+            ggml_tensor * feat = last ? sess_->out_feat_last_ctb : sess_->out_feat_nonlast_ctb;
+            const int64_t tc = sess_->est_att_cache ? sess_->est_att_cache->ne[1] : 0;
+            runner_feed_cfm_noise_ts(loader_.backend(), sess_->ctx, call_id, n_timesteps, temperature, tc,
+                                     feat->ne[0], feat->ne[1], B);
+            omni_set_cann_stage_exact_context(
+                loader_.backend(), last ? "token2mel.last" : "token2mel.nonlast",
+                sess_->epoch, allow_capture, feat->ne[1], tc,
+                reinterpret_cast<uintptr_t>(feat->data));
+            const ggml_status graph_st = ggml_backend_graph_compute(
+                loader_.backend(), last ? sess_->gf_last : sess_->gf_nonlast);
+            if (runner_backend_is_device(loader_.backend())) {
+                ggml_backend_synchronize(loader_.backend());
+            }
+            return graph_st == GGML_STATUS_SUCCESS;
+        };
+
+        if (!prepare_and_compute(false, false) || !prepare_and_compute(false, true) ||
+            !prepare_and_compute(true, false) || !prepare_and_compute(true, true)) {
+            LOG_ERROR("flowGGUFModelRunner.setup_cache: CANN stage-exact warmup/capture failed\n");
+            return false;
+        }
+
+        // Warmup/capture mutates the persistent stream caches. Re-run setup
+        // eagerly to restore the prompt-derived state before exposing it.
+        runner_feed_enc_stream_pos(loader_.backend(), sess_->ctx, loader_.encoder());
+        runner_feed_cfm_noise_ts(loader_.backend(), sess_->ctx, sess_->call_id_setup, n_timesteps, temperature, 0,
+                                 C_mel, T_mel, B);
+        if (ggml_backend_graph_compute(loader_.backend(), sess_->gf_setup) != GGML_STATUS_SUCCESS) {
+            return false;
+        }
+        if (runner_backend_is_device(loader_.backend())) {
+            ggml_backend_synchronize(loader_.backend());
+        }
     }
     cache_out.n_timesteps = n_timesteps;
     if (export_caches_to_host_) {
@@ -7993,6 +8095,10 @@ bool flowGGUFModelRunner::inference_chunk(const int32_t *             token_bt,
         if (disable_last_graph) {
             omni_set_cuda_disable_graph(loader_.backend(), /*disable=*/true);
         }
+        omni_set_cann_stage_exact_context(
+            loader_.backend(), last_chunk ? "token2mel.last" : "token2mel.nonlast",
+            sess_->epoch, /*allow_capture=*/false, T, last_att_len,
+            reinterpret_cast<uintptr_t>(feat->data));
         const ggml_status st = ggml_backend_graph_compute(loader_.backend(), gf);
         if (disable_last_graph) {
             omni_set_cuda_disable_graph(loader_.backend(), /*disable=*/false);
@@ -8489,6 +8595,9 @@ bool flowGGUFModelRunner::init_from_host_caches(const flowStreamCacheHost & cach
             return false;
         }
     }
+    // Loading a prompt cache is a new session incarnation. Reusing an old
+    // graph across this fence is forbidden even if all tensor addresses match.
+    sess_->epoch = ++graph_epoch_counter_;
     std::vector<float> spk_cb;
     runner_bc_to_cb(spk_bc, B, 192, spk_cb);
     backend_tensor_set(loader_.backend(), sess_->spk_cb, spk_cb.data(), spk_cb.size() * sizeof(float));
@@ -8509,17 +8618,33 @@ bool flowGGUFModelRunner::init_from_host_caches(const flowStreamCacheHost & cach
         backend_tensor_set(loader_.backend(), sess_->chunk_token_ids_tb, token_tb.data(),
                                          token_tb.size() * sizeof(int32_t));
         runner_feed_enc_stream_pos(loader_.backend(), sess_->ctx, loader_.encoder());
-        {
-            const int     call_id      = sess_->call_id_nonlast;
-            const int64_t last_att_len = sess_->est_att_cache ? sess_->est_att_cache->ne[1] : 0;
-            ggml_tensor * feat         = sess_->out_feat_nonlast_ctb;
-            const int64_t C            = feat ? feat->ne[0] : 80;
-            const int64_t T            = feat ? feat->ne[1] : 1;
-            runner_feed_cfm_noise_ts(loader_.backend(), sess_->ctx, call_id, n_timesteps, temperature, last_att_len,
-                                         C, T, B);
+        const bool stage_exact = omni_cann_stage_exact_enabled(loader_.backend(), "token2mel");
+        auto prepare_and_compute = [&](bool last, bool allow_capture) {
+            const int call_id = last ? sess_->call_id_last : sess_->call_id_nonlast;
+            ggml_tensor * feat = last ? sess_->out_feat_last_ctb : sess_->out_feat_nonlast_ctb;
+            const int64_t tc = sess_->est_att_cache ? sess_->est_att_cache->ne[1] : 0;
+            runner_feed_cfm_noise_ts(loader_.backend(), sess_->ctx, call_id, n_timesteps, temperature, tc,
+                                     feat ? feat->ne[0] : 80, feat ? feat->ne[1] : 1, B);
+            if (stage_exact) {
+                omni_set_cann_stage_exact_context(
+                    loader_.backend(), last ? "token2mel.last" : "token2mel.nonlast",
+                    sess_->epoch, allow_capture, feat ? feat->ne[1] : 1, tc,
+                    feat ? reinterpret_cast<uintptr_t>(feat->data) : 0);
+            }
+            const ggml_status graph_st = ggml_backend_graph_compute(
+                loader_.backend(), last ? sess_->gf_last : sess_->gf_nonlast);
+            ggml_backend_synchronize(loader_.backend());
+            return graph_st == GGML_STATUS_SUCCESS;
+        };
+        bool warmup_ok = prepare_and_compute(false, false);
+        if (stage_exact) {
+            warmup_ok = warmup_ok && prepare_and_compute(false, true) &&
+                        prepare_and_compute(true, false) && prepare_and_compute(true, true);
         }
-        (void) ggml_backend_graph_compute(loader_.backend(), sess_->gf_nonlast);
-        ggml_backend_synchronize(loader_.backend());
+        if (!warmup_ok) {
+            LOG_ERROR("flowGGUFModelRunner.init_from_host_caches: graph warmup/capture failed\n");
+            return false;
+        }
         backend_tensor_set(loader_.backend(), sess_->conf_cnn_cache,
                                          cache_host.conformer_cnn_cache.data(), cache_host.conformer_cnn_cache.size());
         backend_tensor_set(loader_.backend(), sess_->conf_att_cache,

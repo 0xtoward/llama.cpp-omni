@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <optional>
 #include <string>
 
@@ -10,6 +11,18 @@ enum class ggml_cann_graph_experiment {
     stock,
     decode_bucket,
     layer_islands,
+    stage_exact,
+};
+
+enum class ggml_cann_graph_stage : uint32_t {
+    tts_ar    = 1u << 0,
+    token2mel = 1u << 1,
+};
+
+enum class ggml_cann_stage_exact_action {
+    eager,
+    hit,
+    capture,
 };
 
 enum class ggml_cann_fusion_experiment {
@@ -30,6 +43,7 @@ enum class ggml_cann_layer_engine {
 
 struct ggml_cann_experiment_config {
     ggml_cann_graph_experiment  graph       = ggml_cann_graph_experiment::off;
+    uint32_t                    graph_stages = 0;
     ggml_cann_fusion_experiment fusion      = ggml_cann_fusion_experiment::none;
     ggml_cann_layer_engine      layer_engine = ggml_cann_layer_engine::ggml;
     bool                        trace       = false;
@@ -57,8 +71,43 @@ inline const char * ggml_cann_experiment_name(ggml_cann_graph_experiment value) 
         case ggml_cann_graph_experiment::stock:         return "stock";
         case ggml_cann_graph_experiment::decode_bucket: return "decode_bucket";
         case ggml_cann_graph_experiment::layer_islands: return "layer_islands";
+        case ggml_cann_graph_experiment::stage_exact:   return "stage_exact";
     }
     return "invalid";
+}
+
+inline bool ggml_cann_graph_stage_enabled(
+        const ggml_cann_experiment_config & config,
+        ggml_cann_graph_stage stage) {
+    return (config.graph_stages & static_cast<uint32_t>(stage)) != 0;
+}
+
+inline std::string ggml_cann_graph_stages_name(const ggml_cann_experiment_config & config) {
+    std::string result;
+    if (ggml_cann_graph_stage_enabled(config, ggml_cann_graph_stage::tts_ar)) {
+        result = "tts_ar";
+    }
+    if (ggml_cann_graph_stage_enabled(config, ggml_cann_graph_stage::token2mel)) {
+        if (!result.empty()) {
+            result += ",";
+        }
+        result += "token2mel";
+    }
+    return result;
+}
+
+inline ggml_cann_stage_exact_action ggml_cann_select_stage_exact_action(
+        bool stage_enabled,
+        bool cache_hit,
+        bool allow_capture) {
+    if (!stage_enabled) {
+        return ggml_cann_stage_exact_action::eager;
+    }
+    if (cache_hit) {
+        return ggml_cann_stage_exact_action::hit;
+    }
+    return allow_capture ? ggml_cann_stage_exact_action::capture
+                         : ggml_cann_stage_exact_action::eager;
 }
 
 inline const char * ggml_cann_experiment_name(ggml_cann_fusion_experiment value) {
@@ -96,6 +145,7 @@ inline std::optional<bool> ggml_cann_experiment_parse_bool(const std::string & r
 
 inline ggml_cann_experiment_parse_result ggml_cann_parse_experiment_config(
         const std::optional<std::string> & graph,
+        const std::optional<std::string> & graph_stages,
         const std::optional<std::string> & fusion,
         const std::optional<std::string> & layer_engine,
         const std::optional<std::string> & trace,
@@ -113,9 +163,54 @@ inline ggml_cann_experiment_parse_result ggml_cann_parse_experiment_config(
         result.config.graph = ggml_cann_graph_experiment::decode_bucket;
     } else if (graph_value == "layer_islands") {
         result.config.graph = ggml_cann_graph_experiment::layer_islands;
+    } else if (graph_value == "stage_exact") {
+        result.config.graph = ggml_cann_graph_experiment::stage_exact;
     } else {
-        result.error = "GGML_CANN_GRAPH_EXPERIMENT must be off|stock|decode_bucket|layer_islands";
+        result.error = "GGML_CANN_GRAPH_EXPERIMENT must be off|stock|decode_bucket|layer_islands|stage_exact";
         return result;
+    }
+
+    const std::string stages_value = ggml_cann_experiment_lower(graph_stages.value_or(""));
+    if (result.config.graph != ggml_cann_graph_experiment::stage_exact) {
+        if (!stages_value.empty()) {
+            result.error = "GGML_CANN_GRAPH_STAGES is only valid with GGML_CANN_GRAPH_EXPERIMENT=stage_exact";
+            return result;
+        }
+    } else {
+        if (stages_value.empty()) {
+            result.error = "GGML_CANN_GRAPH_STAGES must list tts_ar and/or token2mel for stage_exact";
+            return result;
+        }
+        if (std::any_of(stages_value.begin(), stages_value.end(), [](unsigned char ch) {
+                return std::isspace(ch);
+            })) {
+            result.error = "GGML_CANN_GRAPH_STAGES must not contain whitespace";
+            return result;
+        }
+        size_t begin = 0;
+        while (begin <= stages_value.size()) {
+            const size_t end = stages_value.find(',', begin);
+            const std::string item = stages_value.substr(
+                begin, end == std::string::npos ? std::string::npos : end - begin);
+            uint32_t bit = 0;
+            if (item == "tts_ar") {
+                bit = static_cast<uint32_t>(ggml_cann_graph_stage::tts_ar);
+            } else if (item == "token2mel") {
+                bit = static_cast<uint32_t>(ggml_cann_graph_stage::token2mel);
+            } else {
+                result.error = "GGML_CANN_GRAPH_STAGES accepts only tts_ar,token2mel";
+                return result;
+            }
+            if ((result.config.graph_stages & bit) != 0) {
+                result.error = "GGML_CANN_GRAPH_STAGES must not contain duplicates";
+                return result;
+            }
+            result.config.graph_stages |= bit;
+            if (end == std::string::npos) {
+                break;
+            }
+            begin = end + 1;
+        }
     }
 
     const std::string fusion_value = ggml_cann_experiment_lower(

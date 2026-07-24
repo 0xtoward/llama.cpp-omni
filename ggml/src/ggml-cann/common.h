@@ -220,6 +220,8 @@ struct ggml_cann_pool_alloc {
 enum class ggml_cann_graph_miss_reason {
     none,
     cold,
+    domain,
+    epoch,
     node_count,
     address,
     op,
@@ -233,6 +235,8 @@ inline const char * ggml_cann_graph_miss_reason_name(ggml_cann_graph_miss_reason
     switch (reason) {
         case ggml_cann_graph_miss_reason::none:       return "none";
         case ggml_cann_graph_miss_reason::cold:       return "cold";
+        case ggml_cann_graph_miss_reason::domain:     return "domain";
+        case ggml_cann_graph_miss_reason::epoch:      return "epoch";
         case ggml_cann_graph_miss_reason::node_count: return "node_count";
         case ggml_cann_graph_miss_reason::address:    return "address";
         case ggml_cann_graph_miss_reason::op:         return "op";
@@ -251,8 +255,17 @@ inline uint64_t ggml_cann_graph_hash_mix(uint64_t hash, uint64_t value) {
     return hash;
 }
 
-inline uint64_t ggml_cann_graph_fingerprint(const ggml_cgraph * cgraph) {
+inline uint64_t ggml_cann_graph_fingerprint(
+        const ggml_cgraph * cgraph,
+        const std::string & domain,
+        uint64_t epoch,
+        uintptr_t primary_address) {
     uint64_t hash = 1469598103934665603ULL;
+    for (unsigned char ch : domain) {
+        hash = ggml_cann_graph_hash_mix(hash, ch);
+    }
+    hash = ggml_cann_graph_hash_mix(hash, epoch);
+    hash = ggml_cann_graph_hash_mix(hash, primary_address);
     hash = ggml_cann_graph_hash_mix(hash, static_cast<uint64_t>(cgraph->n_nodes));
     for (int node_idx = 0; node_idx < cgraph->n_nodes; ++node_idx) {
         const ggml_tensor * node = cgraph->nodes[node_idx];
@@ -365,6 +378,9 @@ struct ggml_cann_graph {
 
     std::vector<ggml_graph_node_properties> ggml_graph_properties;
     uint64_t                                fingerprint = 0;
+    std::string                             domain;
+    uint64_t                                epoch = 0;
+    uintptr_t                               primary_address = 0;
 
     /**
      * @brief Create a new CANN graph from a ggml computation graph.
@@ -383,10 +399,17 @@ struct ggml_cann_graph {
      * @param cgraph The current ggml computation graph.
      * @return Pointer to the newly created ggml_cann_graph object.
      */
-    static ggml_cann_graph * create_from_cgraph(ggml_cgraph * cgraph) {
+    static ggml_cann_graph * create_from_cgraph(
+            ggml_cgraph * cgraph,
+            const std::string & domain,
+            uint64_t epoch,
+            uintptr_t primary_address) {
         ggml_cann_graph * new_graph = new ggml_cann_graph();
         new_graph->ggml_graph_properties.resize(cgraph->n_nodes);
-        new_graph->fingerprint = ggml_cann_graph_fingerprint(cgraph);
+        new_graph->domain = domain;
+        new_graph->epoch = epoch;
+        new_graph->primary_address = primary_address;
+        new_graph->fingerprint = ggml_cann_graph_fingerprint(cgraph, domain, epoch, primary_address);
 
         for (int node_idx = 0; node_idx < cgraph->n_nodes; ++node_idx) {
             ggml_tensor * node = cgraph->nodes[node_idx];
@@ -429,7 +452,20 @@ struct ggml_cann_graph {
      * @param cgraph The current ggml computation graph.
      * @return true if this CANN graph matches the ggml graph; false otherwise.
      */
-    ggml_cann_graph_miss_reason mismatch_reason(const ggml_cgraph * cgraph) const {
+    ggml_cann_graph_miss_reason mismatch_reason(
+            const ggml_cgraph * cgraph,
+            const std::string & domain,
+            uint64_t epoch,
+            uintptr_t primary_address) const {
+        if (this->domain != domain) {
+            return ggml_cann_graph_miss_reason::domain;
+        }
+        if (this->epoch != epoch) {
+            return ggml_cann_graph_miss_reason::epoch;
+        }
+        if (this->primary_address != primary_address) {
+            return ggml_cann_graph_miss_reason::address;
+        }
         if (this->ggml_graph_properties.size() != static_cast<size_t>(cgraph->n_nodes)) {
             return ggml_cann_graph_miss_reason::node_count;
         }
@@ -512,12 +548,16 @@ struct ggml_cann_graph_lru_cache {
      * @param cgraph The current ggml computation graph.
      * @return true if found; false otherwise.
      */
-    ggml_cann_graph_lookup find_and_move_to_front(ggml_cgraph * cgraph) {
+    ggml_cann_graph_lookup find_and_move_to_front(
+            ggml_cgraph * cgraph,
+            const std::string & domain,
+            uint64_t epoch,
+            uintptr_t primary_address) {
         ggml_cann_graph_lookup result;
-        result.fingerprint = ggml_cann_graph_fingerprint(cgraph);
+        result.fingerprint = ggml_cann_graph_fingerprint(cgraph, domain, epoch, primary_address);
         for (auto iterator = cache_list.begin(); iterator != cache_list.end(); ++iterator) {
             ggml_cann_graph * graph_ptr = *iterator;
-            const auto reason = graph_ptr->mismatch_reason(cgraph);
+            const auto reason = graph_ptr->mismatch_reason(cgraph, domain, epoch, primary_address);
             if (reason == ggml_cann_graph_miss_reason::none) {
                 cache_list.erase(iterator);
                 cache_list.push_front(graph_ptr);
@@ -655,6 +695,14 @@ struct ggml_backend_cann_context {
     bool                      acl_graph_mode = true;
 #endif
     ggml_cann_experiment_config experiment_config;
+    struct {
+        std::string domain;
+        uint64_t    epoch = 0;
+        bool        allow_capture = false;
+        int64_t     t_mel = -1;
+        int64_t     tc = -1;
+        uintptr_t   primary_address = 0;
+    } graph_invocation;
     uint64_t                experiment_step = 0;
     uint64_t                experiment_add_rms_hits = 0;
     uint64_t                experiment_add_rms_candidates = 0;
@@ -687,6 +735,7 @@ struct ggml_backend_cann_context {
             parse_bool(get_env_as_lowercase("GGML_CANN_OPERATOR_FUSION").value_or(""));
         const auto parsed = ggml_cann_parse_experiment_config(
             get_env_as_lowercase("GGML_CANN_GRAPH_EXPERIMENT"),
+            get_env_as_lowercase("GGML_CANN_GRAPH_STAGES"),
             get_env_as_lowercase("GGML_CANN_FUSION_EXPERIMENT"),
             get_env_as_lowercase("GGML_CANN_LAYER_ENGINE"),
             get_env_as_lowercase("GGML_CANN_EXPERIMENT_TRACE"),
@@ -696,6 +745,12 @@ struct ggml_backend_cann_context {
             GGML_ABORT("%s", parsed.error.c_str());
         }
         experiment_config = parsed.config;
+        if (ggml_cann_graph_stage_enabled(experiment_config, ggml_cann_graph_stage::tts_ar)) {
+            GGML_LOG_WARN(
+                "%s: stage_exact tts_ar is declared but the llama TTS runner has no ready-time capture hook; "
+                "TTS AR remains eager in this revision\n",
+                __func__);
+        }
 
         if (experiment_config.fusion != ggml_cann_fusion_experiment::none &&
             experiment_config.fusion != ggml_cann_fusion_experiment::add_rms &&
@@ -739,10 +794,11 @@ struct ggml_backend_cann_context {
         std::fprintf(
             stderr,
             "CANN_EXPERIMENT_CONFIG "
-            "{\"device\":%d,\"graph\":\"%s\",\"fusion\":\"%s\","
+            "{\"device\":%d,\"graph\":\"%s\",\"stages\":\"%s\",\"fusion\":\"%s\","
             "\"layer_engine\":\"%s\",\"trace\":%s}\n",
             device,
             ggml_cann_experiment_name(experiment_config.graph),
+            ggml_cann_graph_stages_name(experiment_config).c_str(),
             ggml_cann_experiment_name(experiment_config.fusion),
             ggml_cann_experiment_name(experiment_config.layer_engine),
             experiment_config.trace ? "true" : "false");

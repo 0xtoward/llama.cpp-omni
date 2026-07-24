@@ -2606,19 +2606,44 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
 
     bool graph_capture_required = false;
     const int64_t n_tokens = ggml_cann_graph_token_count(cgraph);
+    const bool stage_exact_mode =
+        cann_ctx->experiment_config.graph == ggml_cann_graph_experiment::stage_exact;
+    const std::string graph_domain =
+        stage_exact_mode ? cann_ctx->graph_invocation.domain : "stock";
+    const uint64_t graph_epoch =
+        stage_exact_mode ? cann_ctx->graph_invocation.epoch : 0;
+    const uintptr_t graph_primary_address =
+        stage_exact_mode ? cann_ctx->graph_invocation.primary_address : 0;
+    const bool graph_capture_allowed =
+        !stage_exact_mode || cann_ctx->graph_invocation.allow_capture;
+    const bool token2mel_domain =
+        graph_domain == "token2mel.nonlast" || graph_domain == "token2mel.last";
+    const bool tts_ar_domain = graph_domain == "tts_ar";
+    const bool stage_exact_domain_enabled =
+        stage_exact_mode &&
+        ((token2mel_domain &&
+          ggml_cann_graph_stage_enabled(cann_ctx->experiment_config, ggml_cann_graph_stage::token2mel)) ||
+         (tts_ar_domain &&
+          ggml_cann_graph_stage_enabled(cann_ctx->experiment_config, ggml_cann_graph_stage::tts_ar)));
 #ifdef USE_ACL_GRAPH
     ggml_cann_graph_lookup graph_lookup;
-    graph_lookup.fingerprint = ggml_cann_graph_fingerprint(cgraph);
+    graph_lookup.fingerprint =
+        ggml_cann_graph_fingerprint(cgraph, graph_domain, graph_epoch, graph_primary_address);
 #endif
 #ifdef USE_ACL_GRAPH
     bool use_cann_graph = true;
 
-    static bool prefill_use_graph = parse_bool(get_env_as_lowercase("GGML_CANN_PREFILL_USE_GRAPH").value_or(""));
-    if (!prefill_use_graph) {
-        // Capture only an explicitly identified one-token decode graph. This
-        // remains valid when FlashAttention is disabled; unknown graph types
-        // stay eager rather than accidentally capturing a prefill graph.
-        use_cann_graph = n_tokens == 1;
+    if (stage_exact_mode) {
+        use_cann_graph = stage_exact_domain_enabled;
+    } else {
+        static bool prefill_use_graph =
+            parse_bool(get_env_as_lowercase("GGML_CANN_PREFILL_USE_GRAPH").value_or(""));
+        if (!prefill_use_graph) {
+            // Capture only an explicitly identified one-token decode graph. This
+            // remains valid when FlashAttention is disabled; unknown graph types
+            // stay eager rather than accidentally capturing a prefill graph.
+            use_cann_graph = n_tokens == 1;
+        }
     }
 
     if (!cann_ctx->acl_graph_mode) {
@@ -2627,12 +2652,21 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
 
     if (use_cann_graph) {
         // If no matching graph is found, the graph needs to be recaptured.
-        graph_lookup = cann_ctx->graph_lru_cache.find_and_move_to_front(cgraph);
-        graph_capture_required = !graph_lookup.found;
+        graph_lookup = cann_ctx->graph_lru_cache.find_and_move_to_front(
+            cgraph, graph_domain, graph_epoch, graph_primary_address);
+        if (stage_exact_mode) {
+            const auto action = ggml_cann_select_stage_exact_action(
+                stage_exact_domain_enabled, graph_lookup.found, graph_capture_allowed);
+            graph_capture_required = action == ggml_cann_stage_exact_action::capture;
+            use_cann_graph = action != ggml_cann_stage_exact_action::eager;
+        } else {
+            graph_capture_required = !graph_lookup.found;
+        }
 
         if (graph_capture_required) {
             // If no matching graph is found, add a new ACL graph.
-            ggml_cann_graph * new_graph = ggml_cann_graph::create_from_cgraph(cgraph);
+            ggml_cann_graph * new_graph = ggml_cann_graph::create_from_cgraph(
+                cgraph, graph_domain, graph_epoch, graph_primary_address);
             cann_ctx->graph_lru_cache.push(new_graph);
 
             // Pre-load rope cache before graph capture.  During capture the
@@ -2647,6 +2681,10 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
                     break;
                 }
             }
+        } else if (!graph_lookup.found) {
+            // stage_exact hot paths are lookup-only. A lifecycle/shape/address
+            // change is an eager miss, never an implicit recapture.
+            use_cann_graph = false;
         }
     }
 #else
@@ -2673,22 +2711,32 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
             miss_reason = graph_capture_required
                 ? ggml_cann_graph_miss_reason_name(graph_lookup.miss_reason)
                 : "none";
+        } else if (stage_exact_domain_enabled && !graph_lookup.found) {
+            graph_event = "miss_eager";
+            miss_reason = ggml_cann_graph_miss_reason_name(graph_lookup.miss_reason);
         }
 #endif
         std::fprintf(
             stderr,
             "CANN_EXPERIMENT_EVENT "
-            "{\"step\":%llu,\"stage\":\"%s\",\"m\":%lld,\"kv_length\":null,"
-            "\"kv_bucket\":null,\"graph_fingerprint\":\"%016llx\","
-            "\"graph_event\":\"%s\",\"miss_reason\":\"%s\","
+            "{\"step\":%llu,\"stage\":\"%s\",\"domain\":\"%s\",\"epoch\":%llu,"
+            "\"capture_allowed\":%s,\"m\":%lld,\"kv_length\":null,\"kv_bucket\":null,"
+            "\"t_mel\":%lld,\"tc\":%lld,\"primary_address\":\"0x%llx\","
+            "\"graph_fingerprint\":\"%016llx\",\"graph_event\":\"%s\",\"miss_reason\":\"%s\","
             "\"fusion_hits\":{\"add_rms\":%llu,\"kv_pair\":%llu},"
             "\"fusion_candidates\":{\"add_rms\":%llu,\"kv_pair\":%llu},"
             "\"slot_casts\":{\"kv_pair\":%llu},"
             "\"sampled_token\":null,\"hidden_rows\":null,"
             "\"cache\":{\"hits\":%llu,\"misses\":%llu,\"captures\":%llu,\"evictions\":%llu}}\n",
             static_cast<unsigned long long>(cann_ctx->experiment_step++),
-            n_tokens == 1 ? "decode" : "prefill_or_other",
+            stage_exact_mode ? "stage_exact" : (n_tokens == 1 ? "decode" : "prefill_or_other"),
+            graph_domain.c_str(),
+            static_cast<unsigned long long>(graph_epoch),
+            graph_capture_allowed ? "true" : "false",
             static_cast<long long>(n_tokens),
+            static_cast<long long>(cann_ctx->graph_invocation.t_mel),
+            static_cast<long long>(cann_ctx->graph_invocation.tc),
+            static_cast<unsigned long long>(graph_primary_address),
             static_cast<unsigned long long>(fingerprint),
             graph_event,
             miss_reason,
@@ -2702,6 +2750,13 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
             static_cast<unsigned long long>(captures),
             static_cast<unsigned long long>(evictions));
         std::fflush(stderr);
+    }
+
+    if (stage_exact_mode) {
+        // Invocation metadata is one-shot. Callers must explicitly tag every
+        // compute, which prevents a previous session/domain leaking into an
+        // unrelated graph.
+        cann_ctx->graph_invocation = {};
     }
 
     return GGML_STATUS_SUCCESS;
@@ -3289,10 +3344,64 @@ static ggml_backend_dev_t ggml_backend_cann_reg_get_device(ggml_backend_reg_t re
     return ctx->devices[index];
 }
 
+static bool ggml_backend_cann_stage_exact_enabled(ggml_backend_t backend, const char * stage) {
+    if (!backend || !ggml_backend_is_cann(backend) || !stage) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_cann_context *>(backend->context);
+    if (ctx->experiment_config.graph != ggml_cann_graph_experiment::stage_exact) {
+        return false;
+    }
+    if (std::strcmp(stage, "token2mel") == 0) {
+        return ggml_cann_graph_stage_enabled(ctx->experiment_config, ggml_cann_graph_stage::token2mel);
+    }
+    if (std::strcmp(stage, "tts_ar") == 0) {
+        return ggml_cann_graph_stage_enabled(ctx->experiment_config, ggml_cann_graph_stage::tts_ar);
+    }
+    return false;
+}
+
+static void ggml_backend_cann_set_stage_exact_context(
+        ggml_backend_t backend,
+        const char * domain,
+        uint64_t epoch,
+        bool allow_capture,
+        int64_t t_mel,
+        int64_t tc,
+        uintptr_t primary_address) {
+    if (!backend || !ggml_backend_is_cann(backend)) {
+        return;
+    }
+    auto * ctx = static_cast<ggml_backend_cann_context *>(backend->context);
+    if (ctx->experiment_config.graph != ggml_cann_graph_experiment::stage_exact) {
+        return;
+    }
+    if (!domain || domain[0] == '\0') {
+        ctx->graph_invocation = {};
+        return;
+    }
+    if (std::strcmp(domain, "token2mel.nonlast") != 0 &&
+        std::strcmp(domain, "token2mel.last") != 0 &&
+        std::strcmp(domain, "tts_ar") != 0 &&
+        std::strcmp(domain, "hift") != 0) {
+        GGML_ABORT("unknown CANN stage-exact graph domain: %s", domain);
+    }
+    ctx->graph_invocation.domain = domain;
+    ctx->graph_invocation.epoch = epoch;
+    ctx->graph_invocation.allow_capture = allow_capture;
+    ctx->graph_invocation.t_mel = t_mel;
+    ctx->graph_invocation.tc = tc;
+    ctx->graph_invocation.primary_address = primary_address;
+}
+
 static void * ggml_backend_cann_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
-    GGML_UNUSED(name);
-    // reserved for future use
+    if (std::strcmp(name, "ggml_backend_cann_stage_exact_enabled") == 0) {
+        return reinterpret_cast<void *>(ggml_backend_cann_stage_exact_enabled);
+    }
+    if (std::strcmp(name, "ggml_backend_cann_set_stage_exact_context") == 0) {
+        return reinterpret_cast<void *>(ggml_backend_cann_set_stage_exact_context);
+    }
     return nullptr;
 }
 
