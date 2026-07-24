@@ -4,6 +4,7 @@
 #include "omni.h"
 #include "token2wav/token2wav-impl.h"
 #include "token2wav/token2wav-backend-policy.h"
+#include "wav-chunk-utils.h"
 
 #include "llama.h"
 #include "common/common.h"
@@ -6170,29 +6171,12 @@ static void move_old_output_to_archive() {
     }
 }
 
-// Helper function to merge all WAV files into a single file
-static void merge_wav_files(const std::string& output_dir, int num_chunks) {
-    if (num_chunks == 0) {
-        LOG_WRN("TTS: no chunks to merge\n");
-        return;
-    }
-    
+// Merge the files actually emitted by Token2wav, in numeric chunk order.
+static void merge_wav_files(const std::string& output_dir) {
     std::string merged_file = output_dir + "/tts_output_merged.wav";
-    
-    // Check all chunk files exist
-    std::vector<std::string> chunk_files;
-    for (int i = 0; i < num_chunks; ++i) {
-        std::string chunk_file = output_dir + "/tts_output_chunk_" + std::to_string(i) + ".wav";
-        struct stat st;
-        if (stat(chunk_file.c_str(), &st) == 0 && st.st_size > 0) {
-            chunk_files.push_back(chunk_file);
-        } else {
-            LOG_WRN("TTS: chunk file %s does not exist or is empty\n", chunk_file.c_str());
-        }
-    }
-    
+    const std::vector<std::string> chunk_files = omni::wav_chunks::list(output_dir);
     if (chunk_files.empty()) {
-        LOG_WRN("TTS: no valid WAV files to merge\n");
+        LOG_WRN("TTS: no non-empty wav_<numeric>.wav files to merge in %s\n", output_dir.c_str());
         return;
     }
     
@@ -6747,8 +6731,6 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                 ctx_omni->warmup_done = true;
                 speek_cv.notify_all();
                 
-                merge_wav_files(tts_wav_output_dir, chunk_idx + 1);
-                
                 if (ctx_omni->duplex_mode && !accumulated_is_end_of_turn) {
                     // LISTEN/CHUNK_EOS: 保持 TTS 状态
                     if (ctx_omni->t2w_thread_info) {
@@ -6832,7 +6814,6 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
             }
             
             // 重置 TTS 状态
-            merge_wav_files(tts_wav_output_dir, chunk_idx + 1);
             llama_memory_t mem = llama_get_memory(ctx_omni->ctx_tts_llama);
             if (mem) {
                 llama_memory_seq_rm(mem, 0, 0, -1);
@@ -7547,8 +7528,6 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
                 speek_cv.notify_all();
                 print_with_timestamp("TTS: finished processing all chunks\n");
                 
-                // Merge all WAV files into a single file
-                merge_wav_files(tts_wav_output_dir, chunk_idx + 1);
                 // Python: end_of_turn = last_id in turn_terminator_token_ids
                 
                 // 🔧 保存当前 round_idx 用于 T2W（递增前的值）
@@ -8843,6 +8822,9 @@ void t2w_thread_func_python(struct omni_context * ctx_omni, common_params *param
             
             if (is_last_window) {
                 if (is_final) {
+                    // Token2wav owns WAV production. Finalize the merged file
+                    // before publishing generation_done.flag to consumers.
+                    merge_wav_files(tts_wav_output_dir);
                     // 写入结束标记
                     std::string done_flag_path = tts_wav_output_dir + "/generation_done.flag";
                     FILE* flag_file = fopen(done_flag_path.c_str(), "w");
@@ -8851,7 +8833,6 @@ void t2w_thread_func_python(struct omni_context * ctx_omni, common_params *param
                         fprintf(flag_file, "%d\n", last_wav_idx);
                         fclose(flag_file);
                     }
-                    
                     token_buffer = {4218, 4218, 4218};
                     
                     // 重置 Python 缓存
@@ -9227,6 +9208,9 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
                 // Python: if is_last_chunk: stream(..., last_chunk=True); buffer = []
                 // 普通 chunk 结束时，剩余 tokens 保留在 buffer 中等待下一个 chunk
                 if (is_final) {
+                    // Token2wav owns WAV production. Finalize the merged file
+                    // before publishing generation_done.flag to consumers.
+                    merge_wav_files(tts_wav_output_dir);
                     // 🚀 [优化] 写入结束标记文件，通知 Python 立即结束（无需等待超时）
                     // 标记文件包含最后一个 wav 的编号，方便 Python 验证
                     {
@@ -9240,7 +9224,6 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
                             print_with_timestamp("T2W线程: 写入结束标记 %s (last_wav=%d)\n", done_flag_path.c_str(), last_wav_idx);
                         }
                     }
-                    
                     // 🔧 [关键] 不调用 Token2WavSession::reset()
                     // 原因：reset() 会把 stream_started_=false，导致下一轮 feed_window 失败
                     // 单工和双工模式都只重置 token_buffer，保持 Token2Wav 的 stream 状态

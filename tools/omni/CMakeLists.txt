@@ -25,6 +25,7 @@ add_library(omni
             token2wav/token2wav.cpp
             token2wav/token2wav.h
             token2wav/token2wav-profile.h
+            wav-chunk-utils.h
             )
 
 # Add CoreML related files when enabled
@@ -198,6 +199,15 @@ endif()
 # voxcpm2-cli build + smoke test (no weights). --help exits non-zero by design,
 # so assert on the usage banner instead of the exit code.
 if (LLAMA_BUILD_TESTS)
+    add_executable(test-omni-wav-chunk-utils test/test-wav-chunk-utils.cpp)
+    target_include_directories(test-omni-wav-chunk-utils PRIVATE .)
+    target_compile_features(test-omni-wav-chunk-utils PRIVATE cxx_std_17)
+    add_test(
+        NAME omni-wav-chunk-utils
+        COMMAND test-omni-wav-chunk-utils
+    )
+    set_tests_properties(omni-wav-chunk-utils PROPERTIES LABELS "main;omni")
+
     add_executable(test-token2wav-backend-policy test/test-token2wav-backend-policy.cpp)
     target_include_directories(test-token2wav-backend-policy PRIVATE .)
     target_compile_features(test-token2wav-backend-policy PRIVATE cxx_std_17)
