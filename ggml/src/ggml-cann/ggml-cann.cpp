@@ -2364,17 +2364,16 @@ static void ggml_cann_execute_kv_pair(
     const size_t token_bytes =
         static_cast<size_t>(d * m) * ggml_type_size(GGML_TYPE_F16);
 
-    auto key_f16 = std::make_unique<ggml_cann_pool_alloc>(ctx.pool(), token_bytes);
-    auto value_f16 = std::make_unique<ggml_cann_pool_alloc>(ctx.pool(), token_bytes);
-    ggml_cann_cast_contiguous(ctx, key->src[0], key_f16->get(), GGML_TYPE_F16);
-    ggml_cann_cast_contiguous(ctx, value->src[0], value_f16->get(), GGML_TYPE_F16);
-
     if (!shared_slots) {
         shared_slots = std::make_unique<ggml_cann_pool_alloc>(
             ctx.pool(), static_cast<size_t>(m) * sizeof(int32_t));
         ggml_cann_cast_i64_to_i32(ctx, key->src[1], shared_slots->get());
         ctx.experiment_kv_pair_slot_casts++;
     }
+    auto key_f16 = std::make_unique<ggml_cann_pool_alloc>(ctx.pool(), token_bytes);
+    auto value_f16 = std::make_unique<ggml_cann_pool_alloc>(ctx.pool(), token_bytes);
+    ggml_cann_cast_contiguous(ctx, key->src[0], key_f16->get(), GGML_TYPE_F16);
+    ggml_cann_cast_contiguous(ctx, value->src[0], value_f16->get(), GGML_TYPE_F16);
     if (ctx.atb_runtime == nullptr) {
         ctx.atb_runtime = ggml_cann_atb_runtime_create(ctx.stream());
     }
@@ -2553,6 +2552,15 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
                 "kv_pair key %s reached graph end without matching value write",
                 ggml_get_name(kv_pair_pending_key));
         }
+        // The CANN pool is a stack allocator. Release per-layer temporaries in
+        // exact reverse allocation order, then release the shared slots that
+        // were allocated before the first pair.
+        for (auto allocation = kv_pair_allocations.rbegin();
+             allocation != kv_pair_allocations.rend();
+             ++allocation) {
+            allocation->reset();
+        }
+        kv_pair_shared_slots.reset();
 #endif
     }
 
