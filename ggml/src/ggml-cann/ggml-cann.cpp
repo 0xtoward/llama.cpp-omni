@@ -2455,13 +2455,15 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
                 : "none";
         }
 #endif
-        GGML_LOG_INFO(
+        std::fprintf(
+            stderr,
             "CANN_EXPERIMENT_EVENT "
             "{\"step\":%llu,\"stage\":\"%s\",\"m\":%lld,\"kv_length\":null,"
             "\"kv_bucket\":null,\"graph_fingerprint\":\"%016llx\","
             "\"graph_event\":\"%s\",\"miss_reason\":\"%s\","
             "\"fusion_hits\":{\"add_rms\":%llu},"
             "\"fusion_candidates\":{\"add_rms\":%llu},"
+            "\"sampled_token\":null,\"hidden_rows\":null,"
             "\"cache\":{\"hits\":%llu,\"misses\":%llu,\"captures\":%llu,\"evictions\":%llu}}\n",
             static_cast<unsigned long long>(cann_ctx->experiment_step++),
             n_tokens == 1 ? "decode" : "prefill_or_other",
@@ -2475,6 +2477,7 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
             static_cast<unsigned long long>(misses),
             static_cast<unsigned long long>(captures),
             static_cast<unsigned long long>(evictions));
+        std::fflush(stderr);
     }
 
     return GGML_STATUS_SUCCESS;

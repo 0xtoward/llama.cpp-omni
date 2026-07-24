@@ -719,14 +719,17 @@ struct ggml_backend_cann_context {
                 ggml_cann_experiment_name(experiment_config.graph));
         }
 #endif
-        GGML_LOG_INFO(
-            "%s: device %d experiments graph=%s fusion=%s layer_engine=%s trace=%d\n",
-            __func__,
+        std::fprintf(
+            stderr,
+            "CANN_EXPERIMENT_CONFIG "
+            "{\"device\":%d,\"graph\":\"%s\",\"fusion\":\"%s\","
+            "\"layer_engine\":\"%s\",\"trace\":%s}\n",
             device,
             ggml_cann_experiment_name(experiment_config.graph),
             ggml_cann_experiment_name(experiment_config.fusion),
             ggml_cann_experiment_name(experiment_config.layer_engine),
-            experiment_config.trace ? 1 : 0);
+            experiment_config.trace ? "true" : "false");
+        std::fflush(stderr);
     }
 
     /**
