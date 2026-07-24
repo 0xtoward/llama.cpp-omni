@@ -306,7 +306,9 @@ void ggml_cann_cast_contiguous(
         void * dst_data,
         ggml_type dst_type) {
     GGML_ASSERT(ggml_is_contiguous(src));
+    int64_t dst_ne[GGML_MAX_DIMS];
     size_t dst_nb[GGML_MAX_DIMS];
+    std::copy(src->ne, src->ne + GGML_MAX_DIMS, dst_ne);
     dst_nb[0] = ggml_type_size(dst_type);
     for (int i = 1; i < GGML_MAX_DIMS; ++i) {
         dst_nb[i] = dst_nb[i - 1] * src->ne[i - 1];
@@ -316,7 +318,7 @@ void ggml_cann_cast_contiguous(
         dst_data,
         ggml_cann_type_mapping(dst_type),
         ggml_type_size(dst_type),
-        src->ne,
+        dst_ne,
         dst_nb,
         GGML_MAX_DIMS);
     aclnn_cast(ctx, acl_src.get(), acl_dst.get(), ggml_cann_type_mapping(dst_type));
