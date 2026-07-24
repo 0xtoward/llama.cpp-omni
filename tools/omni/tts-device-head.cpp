@@ -1,4 +1,5 @@
 #include "tts-device-head.h"
+#include "e2e-trace.h"
 
 #include "common/log.h"
 #include "ggml-alloc.h"
@@ -99,6 +100,7 @@ struct tts_device_head::impl {
     ggml_tensor * head_weight = nullptr;
     ggml_tensor * emb_weight = nullptr;
     ggml_tensor * hidden_input = nullptr;
+    ggml_tensor * head_logits = nullptr;
     ggml_tensor * recent_ids = nullptr;
     ggml_tensor * penalty_neg = nullptr;
     ggml_tensor * penalty_pos = nullptr;
@@ -106,6 +108,8 @@ struct tts_device_head::impl {
     ggml_tensor * eos_id = nullptr;
     ggml_tensor * uniform = nullptr;
     ggml_tensor * top_p_floor_bias = nullptr;
+    ggml_tensor * top_k_keep_mask = nullptr;
+    ggml_tensor * sample_rank_bias = nullptr;
     ggml_tensor * sampled = nullptr;
     ggml_tensor * embedding = nullptr;
     ggml_cgraph * graph = nullptr;
@@ -252,6 +256,7 @@ bool tts_device_head::initialize(
     ggml_set_input(pimpl->hidden_input);
 
     ggml_tensor * logits = ggml_mul_mat(ctx, pimpl->head_weight, pimpl->hidden_input);
+    pimpl->head_logits = logits;
     logits = ggml_reshape_1d(ctx, logits, vocab_size);
 
     if (!greedy) {
@@ -310,27 +315,16 @@ bool tts_device_head::initialize(
                     ctx, sampler_data.logits, 1, vocab_size);
             ggml_tensor * probs_2d = ggml_reshape_2d(
                     ctx, full_probs, 1, vocab_size);
-            // ggml_top_k() returns the correct set but does not guarantee
-            // rank order. Sort that compact set explicitly. Avoid
-            // ggml_argsort_top_k(): its full-vocabulary argsort hidden behind
-            // a K-element view can under-allocate on some graph allocators.
-            ggml_tensor * unordered_indices =
-                    ggml_top_k(ctx, sampler_data.logits, top_k);
-            ggml_tensor * unordered_logits = ggml_reshape_1d(
-                    ctx, ggml_get_rows(ctx, logits_2d, unordered_indices), top_k);
-            ggml_tensor * compact_order =
-                    ggml_argsort(ctx, unordered_logits, GGML_SORT_ORDER_DESC);
-            ggml_tensor * top_indices = ggml_reshape_1d(
-                    ctx,
-                    ggml_get_rows(
-                            ctx,
-                            ggml_reshape_2d(ctx, unordered_indices, 1, top_k),
-                            compact_order),
-                    top_k);
-            ggml_tensor * top_logits = ggml_reshape_1d(
-                    ctx, ggml_get_rows(ctx, logits_2d, top_indices), top_k);
-            ggml_tensor * top_probs = ggml_reshape_1d(
-                    ctx, ggml_get_rows(ctx, probs_2d, top_indices), top_k);
+            // CANN has ARGSORT but no GGML_OP_TOP_K implementation. Keep the
+            // full sorted vocabulary and mask ranks >= K instead of creating
+            // a compact view; this avoids an allocator alias observed with
+            // SET_ROWS inputs on the CPU reference backend.
+            ggml_tensor * full_order =
+                    ggml_argsort(ctx, sampler_data.logits, GGML_SORT_ORDER_DESC);
+            ggml_tensor * sorted_logits = ggml_reshape_1d(
+                    ctx, ggml_get_rows(ctx, logits_2d, full_order), vocab_size);
+            ggml_tensor * sorted_probs = ggml_reshape_1d(
+                    ctx, ggml_get_rows(ctx, probs_2d, full_order), vocab_size);
 
             // CPU keeps candidate i when it belongs to min_keep or when the
             // cumulative probability *before* i is still below top_p.
@@ -338,18 +332,24 @@ bool tts_device_head::initialize(
             // crossing index; the latter is both unnecessary and poorly
             // supported by device backends.
             ggml_tensor * cdf_before =
-                    ggml_sub(ctx, ggml_cumsum(ctx, top_probs), top_probs);
+                    ggml_sub(ctx, ggml_cumsum(ctx, sorted_probs), sorted_probs);
             ggml_tensor * cdf_scaled =
                     ggml_scale_bias(ctx, cdf_before, -1.0f, top_p);
             pimpl->top_p_floor_bias =
-                    ggml_new_tensor_1d(ctx, GGML_TYPE_F32, top_k);
+                    ggml_new_tensor_1d(ctx, GGML_TYPE_F32, vocab_size);
+            pimpl->top_k_keep_mask =
+                    ggml_new_tensor_1d(ctx, GGML_TYPE_F32, vocab_size);
             ggml_set_name(pimpl->top_p_floor_bias, "tts_top_p_floor_bias");
+            ggml_set_name(pimpl->top_k_keep_mask, "tts_top_k_keep_mask");
             ggml_set_input(pimpl->top_p_floor_bias);
+            ggml_set_input(pimpl->top_k_keep_mask);
             cdf_scaled = ggml_add(ctx, cdf_scaled, pimpl->top_p_floor_bias);
-            ggml_tensor * keep_mask = ggml_step(ctx, cdf_scaled);
+            ggml_tensor * keep_mask = ggml_mul(
+                    ctx, ggml_step(ctx, cdf_scaled), pimpl->top_k_keep_mask);
 
-            sampler_data.logits = ggml_add(ctx, top_logits, ggml_log(ctx, keep_mask));
-            sampler_data.candidates = top_indices;
+            sampler_data.logits =
+                    ggml_add(ctx, sorted_logits, ggml_log(ctx, keep_mask));
+            sampler_data.candidates = full_order;
         }
 
         // Reproduce the legacy CPU sampler with a caller-provided float
@@ -362,16 +362,17 @@ bool tts_device_head::initialize(
         ggml_tensor * cdf = ggml_cumsum(ctx, probs);
         ggml_tensor * diff = ggml_sub(ctx, cdf, pimpl->uniform);
         ggml_tensor * mask = ggml_step(ctx, diff);
-        ggml_tensor * count_after = ggml_sum(ctx, mask);
-        const float n_candidates = static_cast<float>(ggml_nelements(mask));
-        ggml_tensor * selected_index = ggml_cast(
-                ctx,
-                ggml_clamp(
-                    ctx,
-                    ggml_scale_bias(ctx, count_after, -1.0f, n_candidates),
-                    0.0f,
-                    n_candidates - 1.0f),
-                GGML_TYPE_I32);
+        // mask is [0, ..., 0, 1, ..., 1]. CANN ARGMAX does not promise the
+        // first index on ties, so multiply by a fixed descending rank. The
+        // first CDF entry crossing the uniform becomes the unique maximum.
+        // This also avoids the unsupported F32 -> I32 CPY/cast path.
+        const int64_t n_candidates = ggml_nelements(mask);
+        pimpl->sample_rank_bias =
+                ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_candidates);
+        ggml_set_name(pimpl->sample_rank_bias, "tts_sample_rank_bias");
+        ggml_set_input(pimpl->sample_rank_bias);
+        ggml_tensor * selected_index = ggml_argmax(
+                ctx, ggml_mul(ctx, mask, pimpl->sample_rank_bias));
 
         sampler_data.sampled = selected_index;
         if (sampler_data.candidates) {
@@ -416,15 +417,30 @@ bool tts_device_head::initialize(
     if (!greedy) {
         const int32_t eos = vocab_size - 1;
         ggml_backend_tensor_set(pimpl->eos_id, &eos, 0, sizeof(eos));
+        const int64_t n_candidates = vocab_size;
+        std::vector<float> rank_bias(n_candidates);
+        for (int64_t i = 0; i < n_candidates; ++i) {
+            rank_bias[i] = static_cast<float>(n_candidates - i);
+        }
+        ggml_backend_tensor_set(
+                pimpl->sample_rank_bias,
+                rank_bias.data(), 0,
+                rank_bias.size() * sizeof(rank_bias[0]));
         if (apply_top_k_p) {
-            std::vector<float> floor_bias(top_k, 0.0f);
+            std::vector<float> floor_bias(vocab_size, 0.0f);
+            std::vector<float> top_k_mask(vocab_size, 0.0f);
             for (int32_t i = 0; i < min_keep; ++i) {
                 floor_bias[i] = std::numeric_limits<float>::infinity();
             }
+            std::fill_n(top_k_mask.begin(), top_k, 1.0f);
             ggml_backend_tensor_set(
                     pimpl->top_p_floor_bias,
                     floor_bias.data(), 0,
                     floor_bias.size() * sizeof(floor_bias[0]));
+            ggml_backend_tensor_set(
+                    pimpl->top_k_keep_mask,
+                    top_k_mask.data(), 0,
+                    top_k_mask.size() * sizeof(top_k_mask[0]));
         }
     }
     LOG_INF("TTS device head: initialized backend=%s hidden=%d vocab=%d sampler=%s "
@@ -510,7 +526,11 @@ bool tts_device_head::forward(
     const float eos_bias = step.force_no_eos
             ? -std::numeric_limits<float>::infinity() : 0.0f;
 
-    ggml_backend_tensor_copy(source, pimpl->hidden_input);
+    {
+        e2e_trace::span hidden_bridge_trace(
+            "tts", "hidden_bridge_d2d", ggml_backend_name(pimpl->backend));
+        ggml_backend_tensor_copy(source, pimpl->hidden_input);
+    }
     if (!pimpl->greedy) {
         ggml_backend_tensor_set(pimpl->recent_ids, ids.data(), 0, ids.size() * sizeof(ids[0]));
         ggml_backend_tensor_set(pimpl->penalty_neg, neg.data(), 0, neg.size() * sizeof(neg[0]));
@@ -520,15 +540,24 @@ bool tts_device_head::forward(
     }
 
     const auto start = std::chrono::steady_clock::now();
-    const ggml_status status = ggml_backend_graph_compute_async(pimpl->backend, pimpl->graph);
-    if (status != GGML_STATUS_SUCCESS) {
-        error = "TTS device head graph compute failed";
-        return false;
+    {
+        e2e_trace::span device_head_trace(
+            "tts", "device_head_graph", ggml_backend_name(pimpl->backend));
+        const ggml_status status =
+            ggml_backend_graph_compute_async(pimpl->backend, pimpl->graph);
+        if (status != GGML_STATUS_SUCCESS) {
+            error = "TTS device head graph compute failed";
+            return false;
+        }
+        ggml_backend_tensor_get_async(
+                pimpl->backend, pimpl->sampled,
+                &selected_relative_token, 0, sizeof(selected_relative_token));
+        {
+            e2e_trace::span scalar_sync_trace(
+                "tts", "token_scalar_sync", ggml_backend_name(pimpl->backend));
+            ggml_backend_synchronize(pimpl->backend);
+        }
     }
-    ggml_backend_tensor_get_async(
-            pimpl->backend, pimpl->sampled,
-            &selected_relative_token, 0, sizeof(selected_relative_token));
-    ggml_backend_synchronize(pimpl->backend);
     const auto stop = std::chrono::steady_clock::now();
 
     if (selected_relative_token < 0 || selected_relative_token >= pimpl->vocab_size) {
@@ -541,6 +570,77 @@ bool tts_device_head::forward(
     selected_embedding.type = static_cast<int32_t>(pimpl->embedding->type);
     for (int d = 0; d < 4; ++d) {
         selected_embedding.ne[d] = pimpl->embedding->ne[d];
+    }
+    auto & trace_state = e2e_trace::global_state();
+    if (trace_state.tensor_enabled()) {
+        const auto ids = e2e_trace::current_context();
+        auto record = [&](const char * action,
+                          const char * role,
+                          const char * producer,
+                          const char * consumer,
+                          const char * shape,
+                          const char * transfer,
+                          const char * claim,
+                          ggml_tensor * tensor,
+                          uint64_t bytes) {
+            e2e_trace::tensor_record row;
+            row.ids = ids;
+            row.stage = "tts";
+            row.action = action;
+            row.tensor_role = role;
+            row.producer = producer;
+            row.consumer = consumer;
+            row.shape = shape;
+            row.dtype = "f32";
+            row.device = ggml_backend_name(pimpl->backend);
+            row.transfer = transfer;
+            row.residency_claim = claim;
+            row.bytes = bytes;
+            row.buffer_id = reinterpret_cast<uintptr_t>(
+                tensor ? tensor->data : nullptr);
+            row.reused = true;
+            trace_state.append_tensor(row);
+        };
+        record(
+            "hidden_bridge",
+            "tts_hidden",
+            "minicpm_tts",
+            "tts_code_head",
+            "[1,768]",
+            "device_to_device",
+            "host_roundtrip_removed",
+            pimpl->hidden_input,
+            static_cast<uint64_t>(pimpl->hidden_size) * sizeof(float));
+        record(
+            "head_logits",
+            "tts_code_logits",
+            "tts_code_head",
+            "device_sampler",
+            "[1,6562]",
+            "none",
+            "host_roundtrip_removed",
+            pimpl->head_logits,
+            static_cast<uint64_t>(pimpl->vocab_size) * sizeof(float));
+        record(
+            "embedding_gather",
+            "tts_next_embedding",
+            "device_gather",
+            "minicpm_tts_decode",
+            "[1,768]",
+            "device_to_device",
+            "host_roundtrip_removed",
+            pimpl->embedding,
+            static_cast<uint64_t>(pimpl->hidden_size) * sizeof(float));
+        record(
+            "sampled_token",
+            "tts_token_scalar",
+            "device_sampler",
+            "host_control",
+            "[1]",
+            "device_to_host",
+            "required_control_scalar",
+            pimpl->sampled,
+            sizeof(selected_relative_token));
     }
     if (pimpl->trace) {
         const double elapsed_us = std::chrono::duration<double, std::micro>(

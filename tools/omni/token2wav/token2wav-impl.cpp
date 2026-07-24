@@ -4,6 +4,7 @@
 #include "token2wav-backend-policy.h"
 #include "token2wav-hift-policy.h"
 #include "token2wav-profile.h"
+#include "../e2e-trace.h"
 
 #include <atomic>
 #include <cstdio>
@@ -6896,6 +6897,7 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
         const state_t::key cache_key{stream_phase, T_mel, Tc};
 
         auto found = state.plans.find(cache_key);
+        const bool plan_cache_hit = found != state.plans.end();
         if (found == state.plans.end()) {
             auto plan = std::make_unique<plan_t>();
             plan->cache_key = cache_key;
@@ -6920,6 +6922,8 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
                 ggml_new_graph_custom(plan->ctx, GGML_DEFAULT_GRAPH_SIZE * 256, false);
 
             {
+                omni::e2e_trace::span trace(
+                    "hift", "build_alloc", ggml_backend_name(model->backend));
                 omni::flow::profile::ScopeTimer timer("voc.build_alloc");
                 if (!voc_hg2_runner_build_graph(
                         plan->ctx,
@@ -6955,6 +6959,8 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
             plan->source_tail_flat->buffer = plan->source_t1_b->buffer;
 
             {
+                omni::e2e_trace::span trace(
+                    "hift", "constants_upload", ggml_backend_name(model->backend));
                 omni::flow::profile::ScopeTimer timer("voc.upload.constants");
                 if (!model->hg2->gen.dsp.hg_stft16_params_upload_consts(model->backend) ||
                     !model->hg2->gen.source_nsf.sine_gen.hg_sine_gen2_upload_consts(model->backend)) {
@@ -6982,15 +6988,43 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
         plan.last_use = ++state.clock;
 
         {
+            omni::e2e_trace::span trace(
+                "hift", "speech_h2d", ggml_backend_name(model->backend));
             omni::flow::profile::ScopeTimer timer("voc.upload.speech");
             hg_backend_tensor_set(
                 model->backend,
                 plan.speech_upload_tcb,
                 speech_feat_bct.data(),
                 speech_feat_bct.size() * sizeof(float));
+            auto & trace_state = omni::e2e_trace::global_state();
+            if (trace_state.tensor_enabled()) {
+                omni::e2e_trace::tensor_record speech;
+                speech.ids = omni::e2e_trace::current_context();
+                speech.stage = "hift";
+                speech.action = "speech_input";
+                speech.tensor_role = "hift_speech_features";
+                speech.producer = "token2mel_host_bridge";
+                speech.consumer = "hift_generator";
+                speech.shape =
+                    "[" + std::to_string(B) + ",80," +
+                    std::to_string(T_mel) + "]";
+                speech.dtype = "f32";
+                speech.device = ggml_backend_name(model->backend);
+                speech.transfer = "host_to_device";
+                speech.residency_claim = "host_roundtrip_present";
+                speech.bytes =
+                    static_cast<uint64_t>(speech_feat_bct.size()) *
+                    sizeof(float);
+                speech.buffer_id =
+                    reinterpret_cast<uintptr_t>(plan.speech_upload_tcb->data);
+                speech.reused = plan_cache_hit;
+                trace_state.append_tensor(speech);
+            }
         }
 
         if (Tc > 0) {
+            omni::e2e_trace::span trace(
+                "hift", "source_cache_d2d", ggml_backend_name(model->backend));
             omni::flow::profile::ScopeTimer timer("voc.source_cache.d2d");
             if (state.active_source_plan &&
                 state.active_source_len == Tc &&
@@ -7030,6 +7064,8 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
         }
 
         {
+            omni::e2e_trace::span trace(
+                "hift", "compute", ggml_backend_name(model->backend));
             omni::flow::profile::ScopeTimer timer("voc.compute");
             const bool allow_capture =
                 state.config.mode == omni::flow::hift_runner_mode::persistent_graph;
@@ -7050,6 +7086,8 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
         }
 
         {
+            omni::e2e_trace::span trace(
+                "hift", "waveform_d2h", ggml_backend_name(model->backend));
             omni::flow::profile::ScopeTimer timer("voc.download.wave");
             std::vector<float> wave_tb;
             if (!hg_read_tensor_2d_tb_f32(model->backend, plan.wave_t_b, wave_tb)) {
@@ -7065,6 +7103,47 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
         out_T_source = plan.source_t1_b->ne[0];
         state.active_source_plan = &plan;
         state.active_source_len = plan.source_tail_len;
+
+        auto & trace_state = omni::e2e_trace::global_state();
+        if (trace_state.tensor_enabled()) {
+            omni::e2e_trace::tensor_record source_cache;
+            source_cache.ids = omni::e2e_trace::current_context();
+            source_cache.stage = "hift";
+            source_cache.action = "source_cache_update";
+            source_cache.tensor_role = "hift_source_cache";
+            source_cache.producer = "hift_generator";
+            source_cache.consumer = "next_hift_chunk";
+            source_cache.shape =
+                "[1," + std::to_string(plan.source_tail_len) + "]";
+            source_cache.dtype = "f32";
+            source_cache.device = ggml_backend_name(model->backend);
+            source_cache.transfer = "device_to_device";
+            source_cache.residency_claim = "persistent_hbm_buffer_reused";
+            source_cache.bytes = ggml_nbytes(plan.source_tail_flat);
+            source_cache.buffer_id =
+                reinterpret_cast<uintptr_t>(plan.source_tail_flat->data);
+            source_cache.reused = plan_cache_hit;
+            trace_state.append_tensor(source_cache);
+
+            omni::e2e_trace::tensor_record waveform;
+            waveform.ids = omni::e2e_trace::current_context();
+            waveform.stage = "hift";
+            waveform.action = "waveform_output";
+            waveform.tensor_role = "pcm_waveform";
+            waveform.producer = "hift_generator";
+            waveform.consumer = "host_pcm";
+            waveform.shape =
+                "[1," + std::to_string(out_T_audio) + "]";
+            waveform.dtype = "f32";
+            waveform.device = ggml_backend_name(model->backend);
+            waveform.transfer = "device_to_host";
+            waveform.residency_claim = "required_output_transfer";
+            waveform.bytes = static_cast<uint64_t>(out_T_audio) * sizeof(float);
+            waveform.buffer_id =
+                reinterpret_cast<uintptr_t>(plan.wave_t_b->data);
+            waveform.reused = true;
+            trace_state.append_tensor(waveform);
+        }
 
         while (state.plans.size() > state.config.plan_cache_capacity) {
             auto victim = state.plans.end();
@@ -7105,6 +7184,8 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
     ggml_tensor * source_t1_b = nullptr;
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, GGML_DEFAULT_GRAPH_SIZE * 256, false);
     {
+        omni::e2e_trace::span trace(
+            "hift", "build_alloc", ggml_backend_name(model->backend));
         omni::flow::profile::ScopeTimer _t("voc.build_alloc");
         if (!voc_hg2_runner_build_graph(ctx, gf, speech_feat_c80_t_b, cache_source_t1_b, &wave_t_b, &source_t1_b)) {
             ggml_free(ctx);
@@ -7117,6 +7198,8 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
         }
     }
     {
+        omni::e2e_trace::span trace(
+            "hift", "upload", ggml_backend_name(model->backend));
         omni::flow::profile::ScopeTimer _t("voc.upload");
         model->hg2->gen.dsp.hg_stft16_params_upload_consts(model->backend);
         model->hg2->gen.source_nsf.sine_gen.hg_sine_gen2_upload_consts(model->backend);
@@ -7125,6 +7208,45 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
         if (Tc > 0) {
             hg_backend_tensor_set(model->backend, cache_source_t1_b, cache_source_bt1.data(),
                                                      cache_source_bt1.size() * sizeof(float));
+        }
+        auto & trace_state = omni::e2e_trace::global_state();
+        if (trace_state.tensor_enabled()) {
+            omni::e2e_trace::tensor_record speech;
+            speech.ids = omni::e2e_trace::current_context();
+            speech.stage = "hift";
+            speech.action = "speech_input";
+            speech.tensor_role = "hift_speech_features";
+            speech.producer = "token2mel_host_bridge";
+            speech.consumer = "hift_generator";
+            speech.shape =
+                "[" + std::to_string(B) + ",80," +
+                std::to_string(T_mel) + "]";
+            speech.dtype = "f32";
+            speech.device = ggml_backend_name(model->backend);
+            speech.transfer = "host_to_device";
+            speech.residency_claim = "host_roundtrip_present";
+            speech.bytes =
+                static_cast<uint64_t>(speech_feat_bct.size()) * sizeof(float);
+            speech.buffer_id =
+                reinterpret_cast<uintptr_t>(speech_upload_tcb->data);
+            speech.reused = false;
+            trace_state.append_tensor(speech);
+
+            if (Tc > 0) {
+                omni::e2e_trace::tensor_record cache = speech;
+                cache.action = "source_cache_input";
+                cache.tensor_role = "hift_source_cache";
+                cache.producer = "previous_hift_host_bridge";
+                cache.shape =
+                    "[" + std::to_string(B) + ",1," +
+                    std::to_string(Tc) + "]";
+                cache.bytes =
+                    static_cast<uint64_t>(cache_source_bt1.size()) *
+                    sizeof(float);
+                cache.buffer_id =
+                    reinterpret_cast<uintptr_t>(cache_source_t1_b->data);
+                trace_state.append_tensor(cache);
+            }
         }
     }
     if (omni::flow::profile::print_graph_enabled()) {
@@ -7137,6 +7259,8 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
         }
     }
     {
+        omni::e2e_trace::span trace(
+            "hift", "compute", ggml_backend_name(model->backend));
         omni::flow::profile::ScopeTimer _t("voc.compute");
         // HiFT is observation-only in stage_exact v1: its dynamic T_mel/Tc
         // and freshly allocated addresses are recorded, but it is never
@@ -7151,6 +7275,8 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
             return false;
         }
     }
+    omni::e2e_trace::span download_trace(
+        "hift", "download", ggml_backend_name(model->backend));
     omni::flow::profile::ScopeTimer _download_timer("voc.download");
     std::vector<float> wave_tb;
     if (!hg_read_tensor_2d_tb_f32(model->backend, wave_t_b, wave_tb)) {
@@ -8338,6 +8464,8 @@ bool flowGGUFModelRunner::inference_chunk(const int32_t *             token_bt,
     std::vector<float> spk_cb;
     runner_bc_to_cb(spk_bc, B, C_spk, spk_cb);
     {
+        omni::e2e_trace::span trace(
+            "token2mel", "upload", ggml_backend_name(loader_.backend()));
         omni::flow::profile::ScopeTimer _t("t2m.upload");
         backend_tensor_set(loader_.backend(), sess_->chunk_token_ids_tb, token_tb.data(),
                                          token_tb.size() * sizeof(int32_t));
@@ -8350,6 +8478,8 @@ bool flowGGUFModelRunner::inference_chunk(const int32_t *             token_bt,
     const int64_t C            = feat->ne[0];
     const int64_t T            = feat->ne[1];
     {
+        omni::e2e_trace::span trace(
+            "token2mel", "noise_timestep", ggml_backend_name(loader_.backend()));
         omni::flow::profile::ScopeTimer _t("t2m.feed_noise");
         runner_feed_cfm_noise_ts(loader_.backend(), sess_->ctx, call_id, n_timesteps, temperature, last_att_len, C, T,
                                      B);
@@ -8372,6 +8502,10 @@ bool flowGGUFModelRunner::inference_chunk(const int32_t *             token_bt,
         }
     }
     {
+        omni::e2e_trace::span trace(
+            "token2mel",
+            last_chunk ? "compute_last" : "compute_nonlast",
+            ggml_backend_name(loader_.backend()));
         omni::flow::profile::ScopeTimer _t("t2m.compute");
         // [PR25-GF_LAST-EAGER] 默认对 last_chunk 走 eager path：
         // 此 backend 上两个图 gf_nonlast / gf_last 形状不同，而 ggml-cuda 每 backend 只保留 1 slot
@@ -8408,11 +8542,34 @@ bool flowGGUFModelRunner::inference_chunk(const int32_t *             token_bt,
         }
     }
     {
+        omni::e2e_trace::span trace(
+            "token2mel", "mel_d2h", ggml_backend_name(loader_.backend()));
         omni::flow::profile::ScopeTimer _t("t2m.download");
         const int64_t      Bb = feat->ne[2];
         std::vector<float> feat_ctb((size_t) C * (size_t) T * (size_t) Bb);
         ggml_backend_tensor_get(feat, feat_ctb.data(), 0, feat_ctb.size() * sizeof(float));
         runner_ctb_to_bct(feat_ctb, C, T, Bb, mel_bct_out);
+        auto & trace_state = omni::e2e_trace::global_state();
+        if (trace_state.tensor_enabled()) {
+            omni::e2e_trace::tensor_record mel;
+            mel.ids = omni::e2e_trace::current_context();
+            mel.stage = "token2mel";
+            mel.action = "mel_output";
+            mel.tensor_role = "token2mel_mel";
+            mel.producer = "cfm";
+            mel.consumer = "hift_host_bridge";
+            mel.shape =
+                "[" + std::to_string(Bb) + "," + std::to_string(C) +
+                "," + std::to_string(T) + "]";
+            mel.dtype = "f32";
+            mel.device = ggml_backend_name(loader_.backend());
+            mel.transfer = "device_to_host";
+            mel.residency_claim = "host_roundtrip_present";
+            mel.bytes = static_cast<uint64_t>(feat_ctb.size()) * sizeof(float);
+            mel.buffer_id = reinterpret_cast<uintptr_t>(feat->data);
+            mel.reused = true;
+            trace_state.append_tensor(mel);
+        }
     }
     cache_out.n_timesteps = n_timesteps;
     if (export_caches_to_host_) {
@@ -10255,12 +10412,19 @@ bool Token2Wav::push_tokens_window(const int32_t *      tokens,
     static thread_local int64_t call_id  = 0;
     const int64_t               cid      = call_id++;
     const bool                  is_first = (cid == 0);
+    omni::e2e_trace::context trace_context =
+        omni::e2e_trace::current_context();
+    trace_context.chunk_id = cid;
+    omni::e2e_trace::context_scope trace_scope(std::move(trace_context));
 
     std::vector<float> mel_bct;
     const auto         t_t2m0 = clock::now();
-    if (!t2m_.push_tokens(tokens, n_tokens, is_final, mel_bct)) {
-        LOG_ERROR("Token2Wav.push_tokens_window: Token2Mel.push_tokens failed\n");
-        return false;
+    {
+        omni::e2e_trace::span trace("token2mel", "compute");
+        if (!t2m_.push_tokens(tokens, n_tokens, is_final, mel_bct)) {
+            LOG_ERROR("Token2Wav.push_tokens_window: Token2Mel.push_tokens failed\n");
+            return false;
+        }
     }
     const auto   t_t2m1  = clock::now();
     const double t2m_ms  = std::chrono::duration<double, std::milli>(t_t2m1 - t_t2m0).count();
@@ -10291,10 +10455,21 @@ bool Token2Wav::push_tokens_window(const int32_t *      tokens,
     std::vector<float> out_source_bt1;
     int64_t            out_T_source = 0;
     const auto t_voc0 = clock::now();
-    if (!voc_runner_.voc_hg2_runner_eval_stream(mel_in_bct, T_mel, voc_cache_source_bt1_, voc_Tc_, wave_bt_out,
-                                                out_T_audio, out_source_bt1, out_T_source, is_final)) {
-        LOG_ERROR( "Token2Wav.push_tokens_window: voc_hg2_runner_eval_stream failed\n");
-        return false;
+    {
+        omni::e2e_trace::span trace("hift", "e2e");
+        if (!voc_runner_.voc_hg2_runner_eval_stream(
+                mel_in_bct,
+                T_mel,
+                voc_cache_source_bt1_,
+                voc_Tc_,
+                wave_bt_out,
+                out_T_audio,
+                out_source_bt1,
+                out_T_source,
+                is_final)) {
+            LOG_ERROR( "Token2Wav.push_tokens_window: voc_hg2_runner_eval_stream failed\n");
+            return false;
+        }
     }
     const auto t_voc1 = clock::now();
 

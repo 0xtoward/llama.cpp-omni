@@ -56,6 +56,27 @@ target_include_directories(omni PRIVATE ../..)
 target_include_directories(omni PRIVATE ../../vendor)
 if (GGML_CANN)
     target_include_directories(omni PRIVATE /usr/local/Ascend/ascend-toolkit/latest/include)
+    find_path(OMNI_MSTX_INCLUDE_DIR
+        NAMES mstx/ms_tools_ext.h
+        HINTS
+            "$ENV{ASCEND_HOME_PATH}/include"
+            "/usr/local/Ascend/ascend-toolkit/latest/include"
+    )
+    find_library(OMNI_MSTX_LIBRARY
+        NAMES ms_tools_ext
+        HINTS
+            "$ENV{ASCEND_HOME_PATH}/tools/mstx/lib64"
+            "/usr/local/Ascend/ascend-toolkit/latest/tools/mstx/lib64"
+    )
+    if (OMNI_MSTX_INCLUDE_DIR AND OMNI_MSTX_LIBRARY)
+        target_include_directories(omni PRIVATE ${OMNI_MSTX_INCLUDE_DIR})
+        target_link_libraries(omni PRIVATE ${OMNI_MSTX_LIBRARY})
+        target_compile_definitions(omni PRIVATE OMNI_E2E_TRACE_HAS_MSTX=1)
+        message(STATUS "Omni MSTX tracing enabled: ${OMNI_MSTX_LIBRARY}")
+    else()
+        target_compile_definitions(omni PRIVATE OMNI_E2E_TRACE_HAS_MSTX=0)
+        message(STATUS "Omni MSTX tracing disabled: header/library not found")
+    endif()
 endif()
 target_compile_features   (omni PRIVATE cxx_std_17)
 
@@ -237,6 +258,15 @@ if (LLAMA_BUILD_TESTS)
         COMMAND test-tts-device-head
     )
     set_tests_properties(tts-device-head PROPERTIES LABELS "main;omni")
+
+    add_executable(test-omni-e2e-trace test/test-e2e-trace.cpp)
+    target_include_directories(test-omni-e2e-trace PRIVATE .)
+    target_compile_features(test-omni-e2e-trace PRIVATE cxx_std_17)
+    add_test(
+        NAME omni-e2e-trace
+        COMMAND test-omni-e2e-trace
+    )
+    set_tests_properties(omni-e2e-trace PROPERTIES LABELS "main;omni")
 
     add_executable(test-omni-sampling-policy test/test-sampling-policy.cpp)
     target_include_directories(test-omni-sampling-policy PRIVATE .)

@@ -6,6 +6,7 @@
 #include "token2wav/token2wav-backend-policy.h"
 #include "sampling-policy.h"
 #include "token-trace.h"
+#include "e2e-trace.h"
 #include "tts-device-head.h"
 #include "wav-chunk-utils.h"
 
@@ -344,7 +345,17 @@ struct LLMOut {
     // 此状态随数据一起传递，避免全局状态 current_turn_ended 的时序问题
     // 只有当 LLM 检测到 TURN_EOS/TTS_EOS/EOS 时才设置为 true
     bool is_end_of_turn = false;
+    omni::e2e_trace::context trace_context;
 };
+
+T2WOut::T2WOut() {
+    const auto & ids = omni::e2e_trace::current_context();
+    trace_session_id = ids.session_id;
+    trace_epoch = ids.epoch;
+    trace_turn_id = ids.turn_id;
+    trace_frame_id = ids.frame_id;
+    trace_chunk_id = ids.chunk_id;
+}
 
  struct TTSThreadInfo{
     const int MAX_QUEUE_SIZE;
@@ -2949,6 +2960,7 @@ static llama_token sample_tts_token_device(
         bool skip_processors,
         bool force_no_eos,
         bool skip_eos_prefill,
+        int token_index_in_chunk,
         int repetition_window,
         bool apply_top_k_p) {
     constexpr llama_token audio_bos_token_id = 151687;
@@ -3037,6 +3049,20 @@ static llama_token sample_tts_token_device(
         LOG_ERR("%s: device head forward failed: %s\n", __func__, error.c_str());
         return 0;
     }
+    if (token_index_in_chunk == 0) {
+        omni::e2e_trace::global_state().append_instant(
+            omni::e2e_trace::current_context(),
+            "tts",
+            "first_code",
+            "cann");
+    }
+    if (token_index_in_chunk == 27) {
+        omni::e2e_trace::global_state().append_instant(
+            omni::e2e_trace::current_context(),
+            "tts",
+            "codes_28",
+            "cann");
+    }
 
     const llama_token id = audio_bos_token_id + relative;
     common_sampler_accept(smpl, id, true);
@@ -3108,6 +3134,7 @@ static llama_token sample_tts_token_simplex(struct common_sampler * smpl, struct
                 /*skip_processors=*/is_audio_bos,
                 force_no_eos,
                 /*skip_eos_prefill=*/!is_final_text_chunk,
+                token_index_in_chunk,
                 /*repetition_window=*/8,
                 /*apply_top_k_p=*/false);
     }
@@ -3386,6 +3413,7 @@ llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context *
                 force_no_eos,
                 /*skip_eos_prefill=*/
                     ctx_omni->duplex_mode && !is_final_text_chunk,
+                token_index_in_chunk,
                 /*repetition_window=*/16,
                 /*apply_top_k_p=*/true);
     }
@@ -4202,12 +4230,14 @@ struct DuplexEncodeReq {
     std::string img_fname;
     int         index;
     int         max_slice_nums;  // -1 = 使用全局
+    omni::e2e_trace::context trace_context;
 };
 
 struct DuplexPrefillPacket {
     std::vector<std::vector<float>> vision_embed;  // [0]=overview, [1..]=slices
     std::vector<float>              audio_embed;
     int                             index = 0;
+    omni::e2e_trace::context        trace_context;
 };
 
 struct DuplexDecodeReq {
@@ -4215,6 +4245,7 @@ struct DuplexDecodeReq {
     int                round_idx = -1;
     std::atomic<bool>  done{false};
     std::atomic<bool>  ok{false};
+    omni::e2e_trace::context trace_context;
 };
 
 // Duplex Stage 3: 特殊 token 的 embedding 查表。
@@ -6722,6 +6753,9 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
         std::vector<llama_token> current_chunk_token_ids;
         std::vector<float> current_chunk_hidden_states;
         int current_chunk_n_embd = 0;
+        omni::e2e_trace::context tts_trace_context =
+            omni::e2e_trace::current_context();
+        bool have_tts_trace_context = false;
         
         // 🔧 [修复双工缺字问题] 从 LLMOut 获取 is_end_of_turn 状态
         bool accumulated_is_end_of_turn = false;
@@ -6752,6 +6786,10 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
             // 累积所有队列中的数据
             while (!queue.empty()) {
                 LLMOut *llm_out = queue.front();
+                if (!have_tts_trace_context) {
+                    tts_trace_context = llm_out->trace_context;
+                    have_tts_trace_context = true;
+                }
                 llm_finish |= llm_out->llm_finish;
                 bool item_is_eot = llm_out->is_end_of_turn;
                 accumulated_is_end_of_turn |= item_is_eot;
@@ -6781,6 +6819,10 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
             }
             lock.unlock();
             ctx_omni->tts_thread_info->cv.notify_all();
+            omni::e2e_trace::context_scope tts_context_scope(
+                tts_trace_context);
+            omni::e2e_trace::span tts_chunk_trace(
+                "tts", "chunk_e2e", "cann");
             
             // 双工模式：如果有新数据，继续处理
             // 🔧 [关键诊断] 每次取出 LLMOut 后都打印状态
@@ -7411,6 +7453,8 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
         std::vector<llama_token> current_chunk_token_ids;
         std::vector<float> current_chunk_hidden_states;
         int current_chunk_n_embd = 0;
+        omni::e2e_trace::context tts_trace_context =
+            omni::e2e_trace::current_context();
             
         // Always wait for queue if not finished, or if finished but need to reset state
         if (!llm_finish || (llm_finish && llm_text.empty())) {
@@ -7440,6 +7484,7 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
             // Python 逻辑：每次只处理一个 chunk，生成对应的 audio tokens
             if (!queue.empty()) {
                 LLMOut *llm_out = queue.front();
+                tts_trace_context = llm_out->trace_context;
                 llm_finish |= llm_out->llm_finish;
                 // 只取一个 chunk 的数据
                 if (!ctx_omni->speek_done || ctx_omni->duplex_mode) {
@@ -7472,6 +7517,10 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
             }
             lock.unlock();
             ctx_omni->tts_thread_info->cv.notify_all();
+            omni::e2e_trace::context_scope tts_context_scope(
+                tts_trace_context);
+            omni::e2e_trace::span tts_chunk_trace(
+                "tts", "chunk_e2e", "cann");
             
             // 🔧 [诊断] 打印取出数据后的关键状态
             print_with_timestamp("TTS: after queue pop - speek_done=%d, llm_finish=%d, llm_text.empty=%d, token_ids.size=%zu\n",
@@ -9397,9 +9446,20 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
         
         std::chrono::steady_clock::time_point oldest_enqueue_time = dequeue_time;
         bool have_enqueue_time = false;
+        omni::e2e_trace::context t2w_trace_context =
+            omni::e2e_trace::current_context();
+        bool have_t2w_trace_context = false;
         while (!queue.empty()) {
             T2WOut *t2w_out = queue.front();
             queue.pop();
+            if (!have_t2w_trace_context) {
+                t2w_trace_context.session_id = t2w_out->trace_session_id;
+                t2w_trace_context.epoch = t2w_out->trace_epoch;
+                t2w_trace_context.turn_id = t2w_out->trace_turn_id;
+                t2w_trace_context.frame_id = t2w_out->trace_frame_id;
+                t2w_trace_context.chunk_id = t2w_out->trace_chunk_id;
+                have_t2w_trace_context = true;
+            }
             if (!have_enqueue_time || t2w_out->enqueue_time < oldest_enqueue_time) {
                 oldest_enqueue_time = t2w_out->enqueue_time;
                 have_enqueue_time = true;
@@ -9416,6 +9476,24 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
         }
         
         lock.unlock();
+        omni::e2e_trace::context_scope t2w_context_scope(
+            t2w_trace_context);
+        if (have_enqueue_time) {
+            const int64_t queue_start_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    oldest_enqueue_time.time_since_epoch()).count();
+            const int64_t queue_end_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    dequeue_time.time_since_epoch()).count();
+            omni::e2e_trace::global_state().append_span(
+                t2w_trace_context,
+                "token2mel",
+                "queue",
+                "host",
+                "",
+                queue_start_ns,
+                queue_end_ns);
+        }
         
         if (new_tokens.empty() && !is_chunk_end && !is_final) {
             continue;
@@ -9509,8 +9587,15 @@ void t2w_thread_func_cpp(struct omni_context * ctx_omni, common_params *params) 
                 double t2w_ms = std::chrono::duration<double, std::milli>(t2w_end - t2w_start).count();
                 
                 if (!chunk_wav.empty()) {
+                    omni::e2e_trace::global_state().append_instant(
+                        omni::e2e_trace::current_context(),
+                        "pcm",
+                        "ready",
+                        "host");
                     // Audio output callback (for WS protocol)
                     if (ctx_omni->audio_output_cb) {
+                        omni::e2e_trace::span audio_send_trace(
+                            "websocket", "audio_send", "host");
                         ctx_omni->audio_output_cb(chunk_wav.data(), static_cast<int>(chunk_wav.size()),
                                                   sample_rate, is_last_window);
                     }
@@ -9806,8 +9891,12 @@ static void duplex_encoder_thread_func(omni_context * ctx_omni, common_params * 
         dup->encoder_cv.notify_all();  // 唤醒可能在等队列空位的 producer
         if (!req) continue;
 
+        omni::e2e_trace::context_scope request_trace(req->trace_context);
+        omni::e2e_trace::span encoder_trace(
+            "apm", "preprocess_encoder", "cann");
         DuplexPrefillPacket * packet = new DuplexPrefillPacket();
         packet->index = req->index;
+        packet->trace_context = req->trace_context;
 
         const bool has_img = !req->img_fname.empty() && ctx_omni->ctx_vision != nullptr;
         const bool has_aud = !req->aud_fname.empty();
@@ -9824,6 +9913,8 @@ static void duplex_encoder_thread_func(omni_context * ctx_omni, common_params * 
         // ---- VPM 任务 ----
         auto vpm_task = [&]() -> double {
             if (!has_img) return 0.0;
+            omni::e2e_trace::span trace(
+                req->trace_context, "apm", "vision_encoder", "cann");
             auto t0 = std::chrono::high_resolution_clock::now();
             if (!omni_image_embed_make_chunks_with_filename(
                     ctx_omni->ctx_vision,
@@ -9841,6 +9932,8 @@ static void duplex_encoder_thread_func(omni_context * ctx_omni, common_params * 
         // ---- APM 任务 ----
         auto apm_task = [&]() -> double {
             if (!has_aud) return 0.0;
+            omni::e2e_trace::span trace(
+                req->trace_context, "apm", "encoder", "cann");
             auto t0 = std::chrono::high_resolution_clock::now();
             auto * audio_embeds = omni_audio_embed_make_with_filename(
                 ctx_omni->ctx_audio, params->cpuparams.n_threads, req->aud_fname);
@@ -10356,6 +10449,13 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
             }
 
             OmniTokenType token_type = get_token_type(ctx_omni, sampled_token);
+            if (token_type == OmniTokenType::SPEAK) {
+                omni::e2e_trace::global_state().append_instant(
+                    omni::e2e_trace::current_context(),
+                    "thinker",
+                    "speak_decision",
+                    "cann");
+            }
 
             if (token_type == OmniTokenType::TURN_EOS
                 || token_type == OmniTokenType::TTS_EOS
@@ -10444,6 +10544,7 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
             && (!response.empty() || llm_finish))
         {
             LLMOut * llm_out = new LLMOut();
+            llm_out->trace_context   = omni::e2e_trace::current_context();
             llm_out->text            = response;
             llm_out->n_past          = ctx_omni->n_past;
             llm_out->llm_finish      = llm_finish;
@@ -10603,6 +10704,10 @@ static void duplex_llm_thread_func(omni_context * ctx_omni, common_params * para
             dup->llm_cv.notify_all();  // encoder 在等 prefill_queue 腾位
 
             if (packet) {
+                omni::e2e_trace::context_scope prefill_context(
+                    packet->trace_context);
+                omni::e2e_trace::span prefill_trace(
+                    "thinker", "prefill", "cann");
                 // Stage 3: 先试 fused（1 次 llama_decode），失败回退到老 5-7 段路径。
                 if (!duplex_do_prefill_one_fused(ctx_omni, params, packet, hidden_size)) {
                     duplex_do_prefill_one(ctx_omni, params, packet, hidden_size);
@@ -10615,6 +10720,10 @@ static void duplex_llm_thread_func(omni_context * ctx_omni, common_params * para
 
         // ---- Phase 2: decode ----
         if (!ctx_omni->break_event.load()) {
+            omni::e2e_trace::context_scope decode_context(
+                decode_req->trace_context);
+            omni::e2e_trace::span decode_trace(
+                "thinker", "decode", "cann");
             bool ok = duplex_do_decode(ctx_omni, params,
                                        decode_req->debug_dir, decode_req->round_idx);
             decode_req->ok.store(ok);
@@ -10646,6 +10755,7 @@ static bool duplex_prefill(omni_context * ctx_omni,
     req->img_fname      = img_fname;
     req->index          = index;
     req->max_slice_nums = max_slice_nums;
+    req->trace_context  = omni::e2e_trace::current_context();
 
     {
         std::unique_lock<std::mutex> lk(dup->encoder_mtx);
@@ -10682,6 +10792,7 @@ static bool duplex_decode(omni_context * ctx_omni,
     DuplexDecodeReq req;
     req.debug_dir = debug_dir;
     req.round_idx = round_idx;
+    req.trace_context = omni::e2e_trace::current_context();
 
     {
         std::unique_lock<std::mutex> lk(dup->llm_mtx);
@@ -11425,6 +11536,13 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                 
                 // 🔧 [使用 token ID 检测] 使用缓存的 token ID 进行检测，比字符串比较更高效
                 OmniTokenType token_type = get_token_type(ctx_omni, sampled_token);
+                if (token_type == OmniTokenType::SPEAK) {
+                    omni::e2e_trace::global_state().append_instant(
+                        omni::e2e_trace::current_context(),
+                        "thinker",
+                        "speak_decision",
+                        "cann");
+                }
                 if (token_type != OmniTokenType::NORMAL) {
                 }
 
@@ -11620,6 +11738,7 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                     llm_chunk_time - ctx_omni->stream_decode_start_time).count();
                 fflush(stdout);
                 LLMOut * llm_out = new LLMOut();
+                llm_out->trace_context = omni::e2e_trace::current_context();
                 llm_out->text = response;
                 llm_out->n_past = ctx_omni->n_past;
                 llm_out->llm_finish = llm_finish;
@@ -11879,6 +11998,8 @@ struct OmniDuplexInflightFrame {
 struct DuplexSession {
     std::atomic<bool> running{false};
     std::string debug_dir;
+    std::string trace_session_id;
+    int64_t trace_epoch = 0;
 
     // pending: push_frame -> prefill_worker
     std::queue<OmniDuplexPendingFrame> pending_frames;
@@ -11919,6 +12040,15 @@ static void duplex_session_prefill_worker_func(omni_context * ctx_omni) {
         // pending 出队 → 通知 push_frame 阻塞侧（如有）队列有空位
         sess->pending_cv.notify_all();
 
+        omni::e2e_trace::context trace_context;
+        trace_context.session_id = sess->trace_session_id;
+        trace_context.epoch = sess->trace_epoch;
+        trace_context.turn_id = ctx_omni->current_turn_id;
+        trace_context.frame_id = pf.frame_id;
+        trace_context.chunk_id = pf.frame_id;
+        omni::e2e_trace::context_scope trace_scope(trace_context);
+        omni::e2e_trace::span prefill_submit_trace(
+            "websocket", "prefill_submit");
         // 调底层 stream_prefill。duplex 路径下这是非阻塞的（推到 encoder_queue 立即返回）。
         bool ok = stream_prefill(ctx_omni, pf.frame.aud_fname, pf.frame.img_fname,
                                  (int)pf.frame_id, pf.frame.max_slice_nums);
@@ -11955,6 +12085,14 @@ static void duplex_session_decode_worker_func(omni_context * ctx_omni) {
         r.user_seq = inf.user_seq;
         r.frame_id = inf.frame_id;
 
+        omni::e2e_trace::context trace_context;
+        trace_context.session_id = sess->trace_session_id;
+        trace_context.epoch = sess->trace_epoch;
+        trace_context.turn_id = ctx_omni->current_turn_id;
+        trace_context.frame_id = inf.frame_id;
+        trace_context.chunk_id = inf.frame_id;
+        omni::e2e_trace::context_scope trace_scope(trace_context);
+
         if (inf.prefill_failed) {
             r.ok = false;
         } else {
@@ -11981,6 +12119,8 @@ static void duplex_session_decode_worker_func(omni_context * ctx_omni) {
             r.ms_decode = std::chrono::duration<double, std::milli>(t_dec_end - t_dec_start).count();
             r.ms_total  = std::chrono::duration<double, std::milli>(t_dec_end - inf.t_push).count();
         }
+        omni::e2e_trace::global_state().append_instant(
+            trace_context, "websocket", "response_done");
         r.ms_prefill_submit = std::chrono::duration<double, std::milli>(inf.t_prefilled - inf.t_push).count();
 
         {
@@ -12025,12 +12165,20 @@ bool omni_duplex_session_begin(struct omni_context * ctx_omni,
     auto * sess = new DuplexSession();
     sess->running.store(true);
     sess->debug_dir = debug_dir.empty() ? std::string("./") : debug_dir;
+    static std::atomic<int64_t> trace_epoch_counter{0};
+    sess->trace_epoch = trace_epoch_counter.fetch_add(1) + 1;
+    sess->trace_session_id = "duplex-" + std::to_string(sess->trace_epoch);
     ctx_omni->duplex_session = sess;
 
     sess->prefill_worker = std::thread(duplex_session_prefill_worker_func, ctx_omni);
     sess->decode_worker  = std::thread(duplex_session_decode_worker_func,  ctx_omni);
 
     print_with_timestamp("omni_duplex_session_begin: session ready (workers started)\n");
+    omni::e2e_trace::context session_context;
+    session_context.session_id = sess->trace_session_id;
+    session_context.epoch = sess->trace_epoch;
+    omni::e2e_trace::global_state().append_instant(
+        session_context, "websocket", "session_ready");
     return true;
 }
 
@@ -12044,6 +12192,7 @@ int64_t omni_duplex_push_frame(struct omni_context * ctx_omni,
     pf.frame    = frame;
     pf.frame_id = sess->frame_id_counter.fetch_add(1) + 1;  // chunk 0 已被 session_begin 占用
     pf.t_push   = std::chrono::high_resolution_clock::now();
+    const int64_t frame_id = pf.frame_id;
 
     {
         std::unique_lock<std::mutex> lk(sess->pending_mtx);
@@ -12052,10 +12201,20 @@ int64_t omni_duplex_push_frame(struct omni_context * ctx_omni,
         });
         if (!sess->running.load()) return -1;
         sess->pending_frames.push(std::move(pf));
+        omni::e2e_trace::context trace_context;
+        trace_context.session_id = sess->trace_session_id;
+        trace_context.epoch = sess->trace_epoch;
+        trace_context.turn_id = ctx_omni->current_turn_id;
+        trace_context.frame_id = frame_id;
+        trace_context.chunk_id = frame_id;
+        trace_context.queue_depth =
+            static_cast<int64_t>(sess->pending_frames.size());
+        omni::e2e_trace::global_state().append_instant(
+            trace_context, "websocket", "input_chunk_end");
     }
     sess->in_flight.fetch_add(1);
     sess->pending_cv.notify_all();
-    return pf.frame_id;
+    return frame_id;
 }
 
 bool omni_duplex_wait_next_frame(struct omni_context * ctx_omni,
@@ -12124,6 +12283,11 @@ void omni_duplex_session_end(struct omni_context * ctx_omni) {
     if (sess->prefill_worker.joinable()) sess->prefill_worker.join();
     if (sess->decode_worker.joinable())  sess->decode_worker.join();
 
+    omni::e2e_trace::context session_context;
+    session_context.session_id = sess->trace_session_id;
+    session_context.epoch = sess->trace_epoch;
+    omni::e2e_trace::global_state().append_instant(
+        session_context, "websocket", "session_end");
     delete sess;
     ctx_omni->duplex_session = nullptr;
     if (ctx_omni->ctx_audio) {

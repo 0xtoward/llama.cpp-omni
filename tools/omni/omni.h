@@ -76,11 +76,20 @@ struct LLMThreadInfo {
 };
 
 struct T2WOut {
+    T2WOut();
+
     std::vector<llama_token> audio_tokens;  // Audio token IDs (25 tokens per chunk)
     bool is_final = false;  // Whether this is the final chunk (turn end)
     bool is_chunk_end = false;  // Whether this is the end of a TTS chunk (flush buffer, but not final)
     int round_idx = -1;  // 🔧 [修复目录同步] 轮次索引，由 TTS 线程设置，T2W 线程使用此值确定输出目录
     std::chrono::steady_clock::time_point enqueue_time = std::chrono::steady_clock::now();
+    // Trace identity is copied at construction so the asynchronous Token2wav
+    // worker can retain the originating session/frame clock domain.
+    std::string trace_session_id;
+    int64_t trace_epoch = 0;
+    int64_t trace_turn_id = 0;
+    int64_t trace_frame_id = 0;
+    int64_t trace_chunk_id = 0;
 };
 
 struct T2WThreadInfo {
