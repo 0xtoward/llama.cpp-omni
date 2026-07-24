@@ -300,6 +300,47 @@ static void aclnn_cast(ggml_backend_cann_context & ctx,
     GGML_CANN_CALL_ACLNN_OP(ctx, Cast, acl_src, cast_data_type, acl_dst);
 }
 
+void ggml_cann_cast_contiguous(
+        ggml_backend_cann_context & ctx,
+        const ggml_tensor * src,
+        void * dst_data,
+        ggml_type dst_type) {
+    GGML_ASSERT(ggml_is_contiguous(src));
+    size_t dst_nb[GGML_MAX_DIMS];
+    dst_nb[0] = ggml_type_size(dst_type);
+    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+        dst_nb[i] = dst_nb[i - 1] * src->ne[i - 1];
+    }
+    acl_tensor_ptr acl_src = ggml_cann_create_tensor(src);
+    acl_tensor_ptr acl_dst = ggml_cann_create_tensor(
+        dst_data,
+        ggml_cann_type_mapping(dst_type),
+        ggml_type_size(dst_type),
+        src->ne,
+        dst_nb,
+        GGML_MAX_DIMS);
+    aclnn_cast(ctx, acl_src.get(), acl_dst.get(), ggml_cann_type_mapping(dst_type));
+}
+
+void ggml_cann_cast_i64_to_i32(
+        ggml_backend_cann_context & ctx,
+        const ggml_tensor * src,
+        void * dst_data) {
+    GGML_ASSERT(src->type == GGML_TYPE_I64);
+    GGML_ASSERT(ggml_is_contiguous(src));
+    int64_t dst_ne[1] = {ggml_nelements(src)};
+    size_t dst_nb[1] = {sizeof(int32_t)};
+    acl_tensor_ptr acl_src = ggml_cann_create_tensor(src);
+    acl_tensor_ptr acl_dst = ggml_cann_create_tensor(
+        dst_data,
+        ACL_INT32,
+        sizeof(int32_t),
+        dst_ne,
+        dst_nb,
+        1);
+    aclnn_cast(ctx, acl_src.get(), acl_dst.get(), ACL_INT32);
+}
+
 void ggml_cann_repeat(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     ggml_tensor * src = dst->src[0];
     GGML_ASSERT(ggml_can_repeat(src, dst));
@@ -4376,4 +4417,3 @@ void ggml_cann_gated_linear_attn(ggml_backend_cann_context & ctx, ggml_tensor * 
         }
     }
 }
-

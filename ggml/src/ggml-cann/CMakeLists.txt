@@ -32,6 +32,8 @@ set(SOC_TYPE_COMPILE_OPTION "ASCEND_${SOC_TYPE_MAJOR_SN}")
 string(TOUPPER ${SOC_TYPE_COMPILE_OPTION} SOC_TYPE_COMPILE_OPTION)
 message(STATUS "CANN: SOC_VERSION =  ${SOC_VERSION}")
 option(USE_ACL_GRAPH "Enable CANN graph execution (ACL graph mode)" OFF)
+option(GGML_CANN_ATB "Enable optional ATB experimental operators" OFF)
+set(GGML_CANN_ATB_ROOT "$ENV{ATB_HOME_PATH}" CACHE PATH "ATB cxx_abi_1 installation root")
 
 if(USE_ACL_GRAPH AND (SOC_TYPE_MAJOR_SN STREQUAL "310P" OR SOC_TYPE_COMPILE_OPTION STREQUAL "ASCEND_310P"))
     message(FATAL_ERROR
@@ -74,6 +76,30 @@ if (CANN_INSTALL_DIR)
     target_link_directories(ggml-cann PRIVATE ${CANN_INSTALL_DIR}/lib64)
 
     target_compile_definitions(ggml-cann PRIVATE "-D${SOC_TYPE_COMPILE_OPTION}")
+
+    if (GGML_CANN_ATB)
+        if (NOT GGML_CANN_ATB_ROOT)
+            set(GGML_CANN_ATB_ROOT "/usr/local/Ascend/nnal/atb/9.0.0/atb/cxx_abi_1")
+        endif()
+        find_path(GGML_CANN_ATB_INCLUDE_DIR atb/atb_infer.h
+            PATHS "${GGML_CANN_ATB_ROOT}/include" NO_DEFAULT_PATH REQUIRED)
+        find_library(GGML_CANN_ATB_LIBRARY atb
+            PATHS "${GGML_CANN_ATB_ROOT}/lib" "${GGML_CANN_ATB_ROOT}/lib64"
+            NO_DEFAULT_PATH REQUIRED)
+        find_library(GGML_CANN_ATB_MIXOPS_LIBRARY atb_mixops
+            PATHS "${GGML_CANN_ATB_ROOT}/lib" "${GGML_CANN_ATB_ROOT}/lib64"
+            NO_DEFAULT_PATH REQUIRED)
+        target_sources(ggml-cann PRIVATE atb_ops.cc)
+        target_include_directories(ggml-cann PRIVATE "${GGML_CANN_ATB_INCLUDE_DIR}")
+        target_compile_definitions(ggml-cann PRIVATE GGML_CANN_USE_ATB=1)
+        target_link_libraries(ggml-cann PRIVATE
+            "${GGML_CANN_ATB_LIBRARY}" "${GGML_CANN_ATB_MIXOPS_LIBRARY}")
+        get_filename_component(GGML_CANN_ATB_LIBRARY_DIR "${GGML_CANN_ATB_LIBRARY}" DIRECTORY)
+        set_property(TARGET ggml-cann APPEND PROPERTY BUILD_RPATH "${GGML_CANN_ATB_LIBRARY_DIR}")
+        message(STATUS "CANN: experimental ATB operators enabled from ${GGML_CANN_ATB_ROOT}")
+    else()
+        message(STATUS "CANN: experimental ATB operators disabled")
+    endif()
 
     if (USE_ACL_GRAPH)
         target_compile_definitions(ggml-cann PRIVATE USE_ACL_GRAPH)

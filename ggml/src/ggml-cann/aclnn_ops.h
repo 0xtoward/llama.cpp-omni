@@ -561,6 +561,18 @@ void ggml_cann_get_rows(ggml_backend_cann_context & ctx, ggml_tensor * dst);
  */
 void ggml_cann_set_rows(ggml_backend_cann_context & ctx, ggml_tensor * dst);
 
+// Experimental fusion helpers. The destination storage is caller-owned and
+// must remain alive until the stream finishes consuming it.
+void ggml_cann_cast_contiguous(
+    ggml_backend_cann_context & ctx,
+    const ggml_tensor * src,
+    void * dst_data,
+    ggml_type dst_type);
+void ggml_cann_cast_i64_to_i32(
+    ggml_backend_cann_context & ctx,
+    const ggml_tensor * src,
+    void * dst_data);
+
 /**
  * @brief   Executes matrix multiplication for the given tensor.
  *

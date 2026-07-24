@@ -27,6 +27,7 @@
 #include "../include/ggml-cann.h"
 #include "../include/ggml.h"
 #include "experiment-config.h"
+#include "atb_ops.h"
 
 #include <acl/acl.h>
 #include <unistd.h>
@@ -657,6 +658,12 @@ struct ggml_backend_cann_context {
     uint64_t                experiment_step = 0;
     uint64_t                experiment_add_rms_hits = 0;
     uint64_t                experiment_add_rms_candidates = 0;
+    uint64_t                experiment_kv_pair_hits = 0;
+    uint64_t                experiment_kv_pair_candidates = 0;
+    uint64_t                experiment_kv_pair_slot_casts = 0;
+#ifdef GGML_CANN_USE_ATB
+    ggml_cann_atb_runtime * atb_runtime = nullptr;
+#endif
     bool                   async_mode;
     // Rope Cache
     ggml_cann_rope_cache   rope_cache;
@@ -691,10 +698,20 @@ struct ggml_backend_cann_context {
         experiment_config = parsed.config;
 
         if (experiment_config.fusion != ggml_cann_fusion_experiment::none &&
-            experiment_config.fusion != ggml_cann_fusion_experiment::add_rms) {
+            experiment_config.fusion != ggml_cann_fusion_experiment::add_rms &&
+            experiment_config.fusion != ggml_cann_fusion_experiment::kv_pair) {
             GGML_ABORT(
                 "GGML_CANN_FUSION_EXPERIMENT=%s is parsed but not implemented; refusing silent fallback",
                 ggml_cann_experiment_name(experiment_config.fusion));
+        }
+#ifndef GGML_CANN_USE_ATB
+        if (experiment_config.fusion == ggml_cann_fusion_experiment::kv_pair) {
+            GGML_ABORT("GGML_CANN_FUSION_EXPERIMENT=kv_pair requires a GGML_CANN_ATB=ON build");
+        }
+#endif
+        if (experiment_config.fusion == ggml_cann_fusion_experiment::kv_pair &&
+            experiment_config.graph != ggml_cann_graph_experiment::off) {
+            GGML_ABORT("GGML_CANN_FUSION_EXPERIMENT=kv_pair currently requires graph=off");
         }
         if (experiment_config.layer_engine != ggml_cann_layer_engine::ggml) {
             GGML_ABORT(
@@ -737,6 +754,10 @@ struct ggml_backend_cann_context {
      */
     ~ggml_backend_cann_context() {
         ggml_cann_set_device(device);
+#ifdef GGML_CANN_USE_ATB
+        ggml_cann_atb_runtime_destroy(atb_runtime);
+        atb_runtime = nullptr;
+#endif
         if (copy_event != nullptr) {
             ACL_CHECK(aclrtDestroyEvent(copy_event));
         }

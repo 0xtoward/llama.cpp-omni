@@ -33,6 +33,7 @@
 #include <stdarg.h>
 
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -2280,6 +2281,118 @@ static bool ggml_cann_can_fuse(const struct ggml_cgraph *          cgraph,
     return ggml_can_fuse(cgraph, node_idx, ops);
 }
 
+#ifdef GGML_CANN_USE_ATB
+static const ggml_tensor * ggml_cann_root_tensor(const ggml_tensor * tensor) {
+    while (tensor != nullptr && tensor->view_src != nullptr) {
+        tensor = tensor->view_src;
+    }
+    return tensor;
+}
+
+static int ggml_cann_cache_layer(const ggml_tensor * node, char kind) {
+    if (node == nullptr || node->src[2] == nullptr) {
+        return -1;
+    }
+    const ggml_tensor * root = ggml_cann_root_tensor(node->src[2]);
+    const char * name = root != nullptr ? ggml_get_name(root) : "";
+    int layer = -1;
+    char pattern[32];
+    std::snprintf(pattern, sizeof(pattern), "cache_%c_l%%d", kind);
+    return std::sscanf(name, pattern, &layer) == 1 ? layer : -1;
+}
+
+static bool ggml_cann_match_kv_pair(
+        const ggml_tensor * key,
+        const ggml_tensor * value,
+        std::string & reason) {
+    const int key_layer = ggml_cann_cache_layer(key, 'k');
+    const int value_layer = ggml_cann_cache_layer(value, 'v');
+    if (key_layer < 0 || value_layer < 0 || key_layer != value_layer) {
+        reason = "cache_name_or_layer";
+        return false;
+    }
+    if (key->op != GGML_OP_SET_ROWS || value->op != GGML_OP_SET_ROWS ||
+        (key->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+        (value->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        reason = "op_or_compute_flag";
+        return false;
+    }
+    for (const ggml_tensor * node : {key, value}) {
+        if (node->src[0] == nullptr || node->src[1] == nullptr ||
+            node->src[2] == nullptr ||
+            node->type != GGML_TYPE_F16 ||
+            node->src[0]->type != GGML_TYPE_F32 ||
+            node->src[1]->type != GGML_TYPE_I64 ||
+            !ggml_is_contiguous(node->src[0]) ||
+            !ggml_is_contiguous(node->src[1]) ||
+            !ggml_is_contiguous(node)) {
+            reason = "dtype_or_layout";
+            return false;
+        }
+    }
+    const int64_t d = key->src[0]->ne[0];
+    const int64_t m = key->src[0]->ne[1];
+    if (d <= 0 || m <= 0 ||
+        value->src[0]->ne[0] != d || value->src[0]->ne[1] != m ||
+        key->src[0]->ne[2] != 1 || key->src[0]->ne[3] != 1 ||
+        value->src[0]->ne[2] != 1 || value->src[0]->ne[3] != 1 ||
+        key->src[1]->ne[0] != m || value->src[1]->ne[0] != m ||
+        ggml_nelements(key->src[1]) != m ||
+        ggml_nelements(value->src[1]) != m) {
+        reason = "source_or_slot_shape";
+        return false;
+    }
+    if (key->ne[0] != d || value->ne[0] != d ||
+        key->ne[1] != value->ne[1] ||
+        key->ne[2] != 1 || key->ne[3] != 1 ||
+        value->ne[2] != 1 || value->ne[3] != 1 ||
+        key->ne[1] <= 0 || key->ne[1] > INT32_MAX) {
+        reason = "cache_shape_or_transposed_v";
+        return false;
+    }
+    return true;
+}
+
+static void ggml_cann_execute_kv_pair(
+        ggml_backend_cann_context & ctx,
+        ggml_tensor * key,
+        ggml_tensor * value,
+        std::vector<std::unique_ptr<ggml_cann_pool_alloc>> & live_allocations,
+        std::unique_ptr<ggml_cann_pool_alloc> & shared_slots) {
+    const int64_t d = key->src[0]->ne[0];
+    const int64_t m = key->src[0]->ne[1];
+    const size_t token_bytes =
+        static_cast<size_t>(d * m) * ggml_type_size(GGML_TYPE_F16);
+
+    auto key_f16 = std::make_unique<ggml_cann_pool_alloc>(ctx.pool(), token_bytes);
+    auto value_f16 = std::make_unique<ggml_cann_pool_alloc>(ctx.pool(), token_bytes);
+    ggml_cann_cast_contiguous(ctx, key->src[0], key_f16->get(), GGML_TYPE_F16);
+    ggml_cann_cast_contiguous(ctx, value->src[0], value_f16->get(), GGML_TYPE_F16);
+
+    if (!shared_slots) {
+        shared_slots = std::make_unique<ggml_cann_pool_alloc>(
+            ctx.pool(), static_cast<size_t>(m) * sizeof(int32_t));
+        ggml_cann_cast_i64_to_i32(ctx, key->src[1], shared_slots->get());
+        ctx.experiment_kv_pair_slot_casts++;
+    }
+    if (ctx.atb_runtime == nullptr) {
+        ctx.atb_runtime = ggml_cann_atb_runtime_create(ctx.stream());
+    }
+    ggml_cann_atb_reshape_and_cache(
+        ctx.atb_runtime,
+        key_f16->get(),
+        value_f16->get(),
+        key->data,
+        value->data,
+        shared_slots->get(),
+        m,
+        d,
+        key->ne[1]);
+    live_allocations.push_back(std::move(key_f16));
+    live_allocations.push_back(std::move(value_f16));
+}
+#endif
+
 static const ggml_tensor * ggml_cann_find_graph_tensor(
         const ggml_cgraph * cgraph, const char * name) {
     for (int node_idx = 0; node_idx < cgraph->n_nodes; ++node_idx) {
@@ -2348,14 +2461,20 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
 #endif  // USE_ACL_GRAPH
     // Only perform the graph execution if CANN graphs are not enabled, or we are capturing the graph.
     // With the use of CANN graphs, the execution will be performed by the graph launch.
-    const bool opt_fusion =
+    const bool opt_add_rms =
         cann_ctx->experiment_config.fusion == ggml_cann_fusion_experiment::add_rms ||
         cann_ctx->experiment_config.fusion == ggml_cann_fusion_experiment::all;
+    const bool opt_kv_pair =
+        cann_ctx->experiment_config.fusion == ggml_cann_fusion_experiment::kv_pair;
 
     if (!use_cann_graph || cann_graph_capture_required) {
+#ifdef GGML_CANN_USE_ATB
+        std::vector<std::unique_ptr<ggml_cann_pool_alloc>> kv_pair_allocations;
+        std::unique_ptr<ggml_cann_pool_alloc> kv_pair_shared_slots;
+#endif
         for (int i = 0; i < cgraph->n_nodes; i++) {
             ggml_tensor * node = cgraph->nodes[i];
-            if (opt_fusion) {
+            if (opt_add_rms) {
                 if (i + 1 < cgraph->n_nodes &&
                     node->op == GGML_OP_ADD &&
                     cgraph->nodes[i + 1]->op == GGML_OP_RMS_NORM) {
@@ -2368,6 +2487,35 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
                     continue;
                 }
             }
+#ifdef GGML_CANN_USE_ATB
+            if (opt_kv_pair && node->op == GGML_OP_SET_ROWS) {
+                const bool key_candidate = ggml_cann_cache_layer(node, 'k') >= 0;
+                const bool value_candidate = ggml_cann_cache_layer(node, 'v') >= 0;
+                if (key_candidate || value_candidate) {
+                    cann_ctx->experiment_kv_pair_candidates++;
+                    std::string reason;
+                    if (!key_candidate || i + 1 >= cgraph->n_nodes ||
+                        !ggml_cann_match_kv_pair(node, cgraph->nodes[i + 1], reason)) {
+                        GGML_ABORT(
+                            "kv_pair candidate %s cannot be fused: %s; "
+                            "requires adjacent F16 non-transposed K/V cache writes",
+                            ggml_get_name(node),
+                            reason.empty() ? "missing_adjacent_value" : reason.c_str());
+                    }
+                    ggml_cann_execute_kv_pair(
+                        *cann_ctx,
+                        node,
+                        cgraph->nodes[i + 1],
+                        kv_pair_allocations,
+                        kv_pair_shared_slots);
+                    cann_ctx->experiment_kv_pair_hits++;
+                    i++;
+                    continue;
+                }
+            }
+#else
+            GGML_UNUSED(opt_kv_pair);
+#endif
 
             if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
                 node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
@@ -2422,6 +2570,9 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
     cann_ctx->rope_cache.cached = false;
     cann_ctx->experiment_add_rms_hits = 0;
     cann_ctx->experiment_add_rms_candidates = 0;
+    cann_ctx->experiment_kv_pair_hits = 0;
+    cann_ctx->experiment_kv_pair_candidates = 0;
+    cann_ctx->experiment_kv_pair_slot_casts = 0;
 
     bool graph_capture_required = false;
     const int64_t n_tokens = ggml_cann_graph_token_count(cgraph);
@@ -2500,8 +2651,9 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
             "{\"step\":%llu,\"stage\":\"%s\",\"m\":%lld,\"kv_length\":null,"
             "\"kv_bucket\":null,\"graph_fingerprint\":\"%016llx\","
             "\"graph_event\":\"%s\",\"miss_reason\":\"%s\","
-            "\"fusion_hits\":{\"add_rms\":%llu},"
-            "\"fusion_candidates\":{\"add_rms\":%llu},"
+            "\"fusion_hits\":{\"add_rms\":%llu,\"kv_pair\":%llu},"
+            "\"fusion_candidates\":{\"add_rms\":%llu,\"kv_pair\":%llu},"
+            "\"slot_casts\":{\"kv_pair\":%llu},"
             "\"sampled_token\":null,\"hidden_rows\":null,"
             "\"cache\":{\"hits\":%llu,\"misses\":%llu,\"captures\":%llu,\"evictions\":%llu}}\n",
             static_cast<unsigned long long>(cann_ctx->experiment_step++),
@@ -2511,7 +2663,10 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
             graph_event,
             miss_reason,
             static_cast<unsigned long long>(cann_ctx->experiment_add_rms_hits),
+            static_cast<unsigned long long>(cann_ctx->experiment_kv_pair_hits),
             static_cast<unsigned long long>(cann_ctx->experiment_add_rms_candidates),
+            static_cast<unsigned long long>(cann_ctx->experiment_kv_pair_candidates),
+            static_cast<unsigned long long>(cann_ctx->experiment_kv_pair_slot_casts),
             static_cast<unsigned long long>(hits),
             static_cast<unsigned long long>(misses),
             static_cast<unsigned long long>(captures),
