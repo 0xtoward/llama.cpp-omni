@@ -2282,6 +2282,23 @@ static int64_t ggml_cann_graph_token_count(const ggml_cgraph * cgraph) {
     if (const ggml_tensor * embeddings = ggml_cann_find_graph_tensor(cgraph, "inp_embd")) {
         return embeddings->ne[1];
     }
+
+    // Backend scheduling may partition away the named input tensors. The
+    // first dense projection still has a static 2-D weight in src[0] and the
+    // token-major activation in src[1]. Attention matmuls have additional
+    // head/batch dimensions and are deliberately excluded.
+    for (int node_idx = 0; node_idx < cgraph->n_nodes; ++node_idx) {
+        const ggml_tensor * node = cgraph->nodes[node_idx];
+        if (node->op != GGML_OP_MUL_MAT || !node->src[0] || !node->src[1]) {
+            continue;
+        }
+        const ggml_tensor * weight = node->src[0];
+        const ggml_tensor * activation = node->src[1];
+        if (weight->ne[1] > 1 && weight->ne[2] == 1 && weight->ne[3] == 1 &&
+            activation->ne[0] == weight->ne[0]) {
+            return activation->ne[1];
+        }
+    }
     return -1;
 }
 
