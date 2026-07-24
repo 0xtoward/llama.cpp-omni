@@ -165,6 +165,8 @@ struct omni_context {
     struct llama_context * ctx_llama = NULL;
     struct llama_model * model = NULL;
     struct common_sampler * ctx_sampler = NULL;
+    struct llama_sampler * backend_sampler_chain = NULL;
+    bool backend_sampling_active = false;
     
     // 🔧 [单双工适配] 是否拥有模型（用于 omni_free 时决定是否释放模型）
     // true: omni_init 内部加载的模型，omni_free 时需要释放

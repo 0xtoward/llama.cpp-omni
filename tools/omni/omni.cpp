@@ -1299,8 +1299,23 @@ static bool eval_string_with_hidden(struct omni_context * ctx_omni, common_param
     return eval_tokens_with_hidden(ctx_omni, params, embd_inp, n_batch, n_past, hidden_states);
 }
 
+static llama_token sample_token(struct common_sampler * smpl, struct omni_context * ctx_omni) {
+    if (!ctx_omni->backend_sampling_active) {
+        return common_sampler_sample(smpl, ctx_omni->ctx_llama, -1);
+    }
+
+    // common_sampler_sample() synchronizes and materializes the full logits
+    // array before checking the backend result. Greedy backend sampling has
+    // already selected the token in the decode graph, so only copy that scalar.
+    return llama_get_sampled_token_ith(ctx_omni->ctx_llama, -1);
+}
+
 static const char * sample(struct common_sampler * smpl, struct omni_context * ctx_omni, common_params* params, int * n_past) {
-    const llama_token id = common_sampler_sample(smpl, ctx_omni->ctx_llama, -1);
+    const llama_token id = sample_token(smpl, ctx_omni);
+    if (id == LLAMA_TOKEN_NULL) {
+        LOG_ERR("backend sampler did not produce a token\n");
+        return nullptr;
+    }
     common_sampler_accept(smpl, id, true);
     static std::string ret;
     if (llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx_omni->ctx_llama)), id)) {
@@ -1313,7 +1328,11 @@ static const char * sample(struct common_sampler * smpl, struct omni_context * c
 }
 
 static const char * sample_with_hidden(struct common_sampler * smpl, struct omni_context * ctx_omni, common_params* params, int * n_past, float *& hidden_states) {
-    const llama_token id = common_sampler_sample(smpl, ctx_omni->ctx_llama, -1);
+    const llama_token id = sample_token(smpl, ctx_omni);
+    if (id == LLAMA_TOKEN_NULL) {
+        LOG_ERR("backend sampler did not produce a token for hidden-state decode\n");
+        return nullptr;
+    }
     common_sampler_accept(smpl, id, true);
     static std::string ret;
     if (llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx_omni->ctx_llama)), id)) {
@@ -1387,7 +1406,11 @@ static const char * sample_with_hidden_and_token(struct common_sampler * smpl, s
         }
     }
     
-    const llama_token id = common_sampler_sample(smpl, ctx_omni->ctx_llama, -1);
+    const llama_token id = sample_token(smpl, ctx_omni);
+    if (id == LLAMA_TOKEN_NULL) {
+        LOG_ERR("backend sampler did not produce a token for hidden-state decode\n");
+        return nullptr;
+    }
     token_id = id;  // 保存token ID
     common_sampler_accept(smpl, id, true);
     static std::string ret;
@@ -4627,6 +4650,35 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         // Python: self.forbidden_token_ids = [self.tts_pad_id] + list(bad_token_ids)
         ctx_omni->special_token_tts_pad = find_token("<|tts_pad|>");
     }
+
+    const char * backend_sampling_env = std::getenv("OMNI_BACKEND_SAMPLING_GREEDY");
+    if (backend_sampling_env && std::strcmp(backend_sampling_env, "1") == 0) {
+        if (ctx_omni->length_penalty != 1.0f || ctx_omni->listen_prob_scale != 1.0f) {
+            LOG_ERR("OMNI_BACKEND_SAMPLING_GREEDY requires length_penalty=1 and listen_prob_scale=1\n");
+            omni_free(ctx_omni);
+            return nullptr;
+        }
+
+        llama_sampler_chain_params chain_params = llama_sampler_chain_default_params();
+        llama_sampler * chain = llama_sampler_chain_init(chain_params);
+        if (ctx_omni->special_token_tts_pad >= 0) {
+            const llama_logit_bias bias = {ctx_omni->special_token_tts_pad, -INFINITY};
+            llama_sampler_chain_add(
+                chain,
+                llama_sampler_init_logit_bias(llama_vocab_n_tokens(vocab), 1, &bias));
+        }
+        llama_sampler_chain_add(chain, llama_sampler_init_greedy());
+
+        if (!llama_set_sampler(ctx_omni->ctx_llama, 0, chain)) {
+            llama_sampler_free(chain);
+            LOG_ERR("OMNI_BACKEND_SAMPLING_GREEDY could not offload the sampler chain\n");
+            omni_free(ctx_omni);
+            return nullptr;
+        }
+        ctx_omni->backend_sampler_chain = chain;
+        ctx_omni->backend_sampling_active = true;
+        LOG_INF("OMNI_BACKEND_SAMPLING_GREEDY active: backend logit-bias + argmax\n");
+    }
         
     // ANE/CoreML warmup: pre-load models into NPU to avoid first-inference latency
     omni_warmup_ane(ctx_omni);
@@ -4861,6 +4913,13 @@ void omni_free(struct omni_context * ctx_omni) {
         }
     }
     
+    if (ctx_omni->backend_sampler_chain) {
+        llama_set_sampler(ctx_omni->ctx_llama, 0, nullptr);
+        llama_sampler_free(ctx_omni->backend_sampler_chain);
+        ctx_omni->backend_sampler_chain = nullptr;
+        ctx_omni->backend_sampling_active = false;
+    }
+
     // 🔧 [单双工适配] 只有在拥有模型时才释放 LLM model 和 context
     // 如果是外部传入的模型（模型复用），则不释放
     if (ctx_omni->owns_model) {
