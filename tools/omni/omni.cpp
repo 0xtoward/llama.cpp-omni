@@ -6713,6 +6713,12 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
 
     // Multi Round Persistent Loop
     while(tts_thread_running) {
+        // Keep the request trace context active for the full TTS iteration.
+        // The previous block-local scope ended immediately after dequeuing the
+        // LLMOut, so device-head and T2W handoff events lost their frame ids.
+        std::unique_ptr<omni::e2e_trace::context_scope> tts_context_scope;
+        std::unique_ptr<omni::e2e_trace::span>          tts_chunk_trace;
+
         if (!tts_thread_running) {
             break;
         }
@@ -6819,9 +6825,10 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
             }
             lock.unlock();
             ctx_omni->tts_thread_info->cv.notify_all();
-            omni::e2e_trace::context_scope tts_context_scope(
-                tts_trace_context);
-            omni::e2e_trace::span tts_chunk_trace(
+            tts_context_scope =
+                std::make_unique<omni::e2e_trace::context_scope>(
+                    tts_trace_context);
+            tts_chunk_trace = std::make_unique<omni::e2e_trace::span>(
                 "tts", "chunk_e2e", "cann");
             
             // 双工模式：如果有新数据，继续处理
@@ -7399,6 +7406,10 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
 
     // Multi Round Persistent Loop
     while(tts_thread_running) {
+        // Keep the dequeued request context active until this TTS iteration
+        // finishes so the device head and the T2W queue inherit the same ids.
+        std::unique_ptr<omni::e2e_trace::context_scope> tts_context_scope;
+        std::unique_ptr<omni::e2e_trace::span>          tts_chunk_trace;
         
         if (!tts_thread_running) {
             break;
@@ -7517,9 +7528,10 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
             }
             lock.unlock();
             ctx_omni->tts_thread_info->cv.notify_all();
-            omni::e2e_trace::context_scope tts_context_scope(
-                tts_trace_context);
-            omni::e2e_trace::span tts_chunk_trace(
+            tts_context_scope =
+                std::make_unique<omni::e2e_trace::context_scope>(
+                    tts_trace_context);
+            tts_chunk_trace = std::make_unique<omni::e2e_trace::span>(
                 "tts", "chunk_e2e", "cann");
             
             // 🔧 [诊断] 打印取出数据后的关键状态
