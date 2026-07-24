@@ -2465,7 +2465,8 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
         cann_ctx->experiment_config.fusion == ggml_cann_fusion_experiment::add_rms ||
         cann_ctx->experiment_config.fusion == ggml_cann_fusion_experiment::all;
     const bool opt_kv_pair =
-        cann_ctx->experiment_config.fusion == ggml_cann_fusion_experiment::kv_pair;
+        cann_ctx->experiment_config.fusion == ggml_cann_fusion_experiment::kv_pair &&
+        ggml_cann_graph_token_count(cgraph) == 1;
 
     if (!use_cann_graph || cann_graph_capture_required) {
 #ifdef GGML_CANN_USE_ATB
