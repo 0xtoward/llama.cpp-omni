@@ -346,6 +346,14 @@ bool tts_device_head::initialize(
             ggml_tensor * full_order =
                     ggml_argsort(ctx, sampler_data.logits, GGML_SORT_ORDER_DESC);
             pimpl->candidate_order = full_order;
+            // The sorted indices are consumed twice by the probability path
+            // and once more after sampling to map the selected rank back to a
+            // vocabulary id.  Keep the tiny I32 vector live for the complete
+            // graph.  Without this output fence gallocr can reuse its storage
+            // after the first two GET_ROWS nodes; OMNI_TTS_DEBUG_DUMP used to
+            // hide that lifetime bug by marking the tensor as an output only
+            // in diagnostic runs.
+            ggml_set_output(pimpl->candidate_order);
             ggml_tensor * sorted_logits = ggml_reshape_1d(
                     ctx, ggml_get_rows(ctx, logits_2d, full_order), vocab_size);
             ggml_tensor * sorted_probs = ggml_reshape_1d(
