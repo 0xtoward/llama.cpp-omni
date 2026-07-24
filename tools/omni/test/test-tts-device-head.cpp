@@ -43,6 +43,28 @@ static bool test_backend_is_cann(ggml_backend_t backend) {
            name.find("cann") != std::string::npos;
 }
 
+static void assert_production_transfer_contract(
+        const omni::tts_device_head & runner,
+        int hidden_size,
+        bool stochastic) {
+    const auto stats = runner.last_transfer_stats();
+    assert(stats.production_contract_ok());
+    assert(stats.d2h_bytes == sizeof(int32_t));
+    assert(stats.control_scalar_d2h_bytes == sizeof(int32_t));
+    assert(stats.d2d_bytes ==
+           static_cast<uint64_t>(hidden_size) * sizeof(float));
+    assert(stats.hidden_d2h_bytes == 0);
+    assert(stats.logits_d2h_bytes == 0);
+    assert(stats.embedding_h2d_bytes == 0);
+    assert(stats.embedding_d2h_bytes == 0);
+    assert(stats.diagnostic_d2h_bytes == 0);
+    if (stochastic) {
+        assert(stats.h2d_bytes > 0);
+    } else {
+        assert(stats.h2d_bytes == 0);
+    }
+}
+
 static void test_config() {
     omni::tts_device_head_config config;
     std::string error;
@@ -130,6 +152,10 @@ static void test_greedy_device_graph() {
     int32_t token = -1;
     llama_device_tensor selected_embedding = {};
     assert(runner.forward(hidden, step, token, selected_embedding, error));
+    // Validate the runner's own hot path before this test intentionally reads
+    // the selected embedding back for numerical comparison.
+    assert_production_transfer_contract(
+            runner, hidden_size, /*stochastic=*/false);
     assert(token == 3);
     assert(selected_embedding.tensor != nullptr);
     assert(selected_embedding.backend == backend);
@@ -332,6 +358,8 @@ static void test_fixed_uniform_32_codes(bool apply_top_k_p) {
         int32_t actual = -1;
         llama_device_tensor selected_embedding = {};
         assert(runner.forward(hidden, step, actual, selected_embedding, error));
+        assert_production_transfer_contract(
+                runner, hidden_size, /*stochastic=*/true);
         if (actual != expected) {
             std::cerr << "fixed-uniform mismatch at step " << step_idx
                       << ": actual=" << actual << " expected=" << expected

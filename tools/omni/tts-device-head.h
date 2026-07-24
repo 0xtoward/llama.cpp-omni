@@ -37,6 +37,32 @@ struct tts_device_head_step {
     float uniform = 0.0f;
 };
 
+// Transfer ledger for one forward() call.  Initialization-time weight uploads
+// are intentionally excluded.  The selected token also carries the stop/EOS
+// decision, so a production step needs one int32 control scalar D2H and no
+// separate stop-flag transfer.
+struct tts_device_head_transfer_stats {
+    uint64_t h2d_bytes = 0;
+    uint64_t d2h_bytes = 0;
+    uint64_t d2d_bytes = 0;
+    uint64_t control_scalar_d2h_bytes = 0;
+    uint64_t hidden_d2h_bytes = 0;
+    uint64_t logits_d2h_bytes = 0;
+    uint64_t embedding_h2d_bytes = 0;
+    uint64_t embedding_d2h_bytes = 0;
+    uint64_t diagnostic_d2h_bytes = 0;
+
+    bool production_contract_ok() const {
+        return d2h_bytes == sizeof(int32_t) &&
+               control_scalar_d2h_bytes == sizeof(int32_t) &&
+               hidden_d2h_bytes == 0 &&
+               logits_d2h_bytes == 0 &&
+               embedding_h2d_bytes == 0 &&
+               embedding_d2h_bytes == 0 &&
+               diagnostic_d2h_bytes == 0;
+    }
+};
+
 // Persistent accelerator-side MiniCPMTTS code head.
 //
 // The runner owns its head/embedding weights and compute graph, but borrows the
@@ -78,6 +104,7 @@ public:
 
     void reset();
     bool initialized() const;
+    tts_device_head_transfer_stats last_transfer_stats() const;
 
 private:
     struct impl;

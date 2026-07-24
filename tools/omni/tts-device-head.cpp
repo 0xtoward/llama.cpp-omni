@@ -131,6 +131,7 @@ struct tts_device_head::impl {
     bool greedy = false;
     bool apply_top_k_p = false;
     bool trace = false;
+    tts_device_head_transfer_stats last_transfer;
 
     ~impl() {
         if (sampler) {
@@ -520,6 +521,7 @@ bool tts_device_head::forward(
     error.clear();
     selected_relative_token = -1;
     selected_embedding = {};
+    pimpl->last_transfer = {};
     if (!initialized()) {
         error = "TTS device head is not initialized";
         return false;
@@ -588,13 +590,20 @@ bool tts_device_head::forward(
         e2e_trace::span hidden_bridge_trace(
             "tts", "hidden_bridge_d2d", ggml_backend_name(pimpl->backend));
         ggml_backend_tensor_copy(source, pimpl->hidden_input);
+        pimpl->last_transfer.d2d_bytes +=
+                static_cast<uint64_t>(pimpl->hidden_size) * sizeof(float);
     }
     if (!pimpl->greedy) {
-        ggml_backend_tensor_set(pimpl->recent_ids, ids.data(), 0, ids.size() * sizeof(ids[0]));
-        ggml_backend_tensor_set(pimpl->penalty_neg, neg.data(), 0, neg.size() * sizeof(neg[0]));
-        ggml_backend_tensor_set(pimpl->penalty_pos, pos.data(), 0, pos.size() * sizeof(pos[0]));
+        const uint64_t ids_bytes = ids.size() * sizeof(ids[0]);
+        const uint64_t neg_bytes = neg.size() * sizeof(neg[0]);
+        const uint64_t pos_bytes = pos.size() * sizeof(pos[0]);
+        ggml_backend_tensor_set(pimpl->recent_ids, ids.data(), 0, ids_bytes);
+        ggml_backend_tensor_set(pimpl->penalty_neg, neg.data(), 0, neg_bytes);
+        ggml_backend_tensor_set(pimpl->penalty_pos, pos.data(), 0, pos_bytes);
         ggml_backend_tensor_set(pimpl->eos_bias, &eos_bias, 0, sizeof(eos_bias));
         ggml_backend_tensor_set(pimpl->uniform, &step.uniform, 0, sizeof(step.uniform));
+        pimpl->last_transfer.h2d_bytes += ids_bytes + neg_bytes + pos_bytes +
+                sizeof(eos_bias) + sizeof(step.uniform);
     }
 
     const auto start = std::chrono::steady_clock::now();
@@ -610,6 +619,9 @@ bool tts_device_head::forward(
         ggml_backend_tensor_get_async(
                 pimpl->backend, pimpl->sampled,
                 &selected_relative_token, 0, sizeof(selected_relative_token));
+        pimpl->last_transfer.d2h_bytes += sizeof(selected_relative_token);
+        pimpl->last_transfer.control_scalar_d2h_bytes +=
+                sizeof(selected_relative_token);
         {
             e2e_trace::span scalar_sync_trace(
                 "tts", "token_scalar_sync", ggml_backend_name(pimpl->backend));
@@ -640,6 +652,12 @@ bool tts_device_head::forward(
         ggml_backend_tensor_get(
                 pimpl->sample_scores, scores.data(), 0,
                 scores.size() * sizeof(scores[0]));
+        const uint64_t float_dump_bytes =
+                (probs.size() + cdf.size() + mask.size() + scores.size()) *
+                sizeof(float);
+        pimpl->last_transfer.d2h_bytes += float_dump_bytes;
+        pimpl->last_transfer.logits_d2h_bytes += float_dump_bytes;
+        pimpl->last_transfer.diagnostic_d2h_bytes += float_dump_bytes;
         std::fprintf(
                 stderr,
                 "TTS_DEVICE_DEBUG uniform=%.9g selected=%d n=%lld\n",
@@ -664,6 +682,9 @@ bool tts_device_head::forward(
                     pimpl->candidate_order,
                     order.data(), 0,
                     order.size() * sizeof(order[0]));
+            const uint64_t order_bytes = order.size() * sizeof(order[0]);
+            pimpl->last_transfer.d2h_bytes += order_bytes;
+            pimpl->last_transfer.diagnostic_d2h_bytes += order_bytes;
             std::fprintf(stderr, "TTS_DEVICE_DEBUG order=");
             for (int64_t i = 0; i < std::min<int64_t>(
                      static_cast<int64_t>(order.size()), 32); ++i) {
@@ -755,10 +776,20 @@ bool tts_device_head::forward(
         const double elapsed_us = std::chrono::duration<double, std::micro>(
                 stop - start).count();
         LOG_INF("TTS device head step: token=%d eos=%d compute_sync_us=%.3f "
-                "d2h_bytes=%zu hidden_d2h_bytes=0 logits_d2h_bytes=0 emb_h2d_bytes=0\n",
+                "d2h_bytes=%llu h2d_bytes=%llu d2d_bytes=%llu "
+                "hidden_d2h_bytes=%llu logits_d2h_bytes=%llu "
+                "emb_h2d_bytes=%llu emb_d2h_bytes=%llu contract_ok=%d\n",
                 selected_relative_token,
                 selected_relative_token == pimpl->vocab_size - 1,
-                elapsed_us, sizeof(selected_relative_token));
+                elapsed_us,
+                static_cast<unsigned long long>(pimpl->last_transfer.d2h_bytes),
+                static_cast<unsigned long long>(pimpl->last_transfer.h2d_bytes),
+                static_cast<unsigned long long>(pimpl->last_transfer.d2d_bytes),
+                static_cast<unsigned long long>(pimpl->last_transfer.hidden_d2h_bytes),
+                static_cast<unsigned long long>(pimpl->last_transfer.logits_d2h_bytes),
+                static_cast<unsigned long long>(pimpl->last_transfer.embedding_h2d_bytes),
+                static_cast<unsigned long long>(pimpl->last_transfer.embedding_d2h_bytes),
+                pimpl->last_transfer.production_contract_ok());
     }
     return true;
 }
@@ -769,6 +800,10 @@ void tts_device_head::reset() {
 
 bool tts_device_head::initialized() const {
     return pimpl && pimpl->backend && pimpl->graph && pimpl->allocator;
+}
+
+tts_device_head_transfer_stats tts_device_head::last_transfer_stats() const {
+    return pimpl ? pimpl->last_transfer : tts_device_head_transfer_stats{};
 }
 
 } // namespace omni
