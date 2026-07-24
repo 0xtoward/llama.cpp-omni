@@ -2854,6 +2854,7 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
         case GGML_OP_GET_ROWS:
             {
                 switch (op->src[0]->type) {
+                    case GGML_TYPE_I32:
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:
 #ifndef ASCEND_310P

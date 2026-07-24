@@ -2072,7 +2072,7 @@ void ggml_cann_get_rows(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     ggml_tensor * src1 = dst->src[1];  // index
 
     GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16
-                || dst->type == GGML_TYPE_BF16);
+                || dst->type == GGML_TYPE_BF16 || dst->type == GGML_TYPE_I32);
 
     // n_idx: number of row indices per (i2, i3) batch slice.
     // ggml guarantees: src0->ne[2] == src1->ne[1], src0->ne[3] == src1->ne[2], src1->ne[3] == 1.
@@ -2110,6 +2110,14 @@ void ggml_cann_get_rows(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     };
 
     switch (src0->type) {
+        case GGML_TYPE_I32:
+            GGML_ASSERT(dst->type == GGML_TYPE_I32);
+            gather_batched(
+                    src0->data,
+                    ACL_INT32,
+                    sizeof(int32_t),
+                    src0->nb);
+            break;
         case GGML_TYPE_BF16:
         case GGML_TYPE_F16:
         case GGML_TYPE_F32:
