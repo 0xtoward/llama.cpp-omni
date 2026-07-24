@@ -110,6 +110,10 @@ struct tts_device_head::impl {
     ggml_tensor * top_p_floor_bias = nullptr;
     ggml_tensor * top_k_keep_mask = nullptr;
     ggml_tensor * sample_rank_bias = nullptr;
+    ggml_tensor * sample_probs = nullptr;
+    ggml_tensor * sample_cdf = nullptr;
+    ggml_tensor * sample_mask = nullptr;
+    ggml_tensor * sample_scores = nullptr;
     ggml_tensor * sampled = nullptr;
     ggml_tensor * embedding = nullptr;
     ggml_cgraph * graph = nullptr;
@@ -362,6 +366,9 @@ bool tts_device_head::initialize(
         ggml_tensor * cdf = ggml_cumsum(ctx, probs);
         ggml_tensor * diff = ggml_sub(ctx, cdf, pimpl->uniform);
         ggml_tensor * mask = ggml_step(ctx, diff);
+        pimpl->sample_probs = probs;
+        pimpl->sample_cdf = cdf;
+        pimpl->sample_mask = mask;
         // mask is [0, ..., 0, 1, ..., 1]. CANN ARGMAX does not promise the
         // first index on ties, so multiply by a fixed descending rank. The
         // first CDF entry crossing the uniform becomes the unique maximum.
@@ -371,8 +378,10 @@ bool tts_device_head::initialize(
                 ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_candidates);
         ggml_set_name(pimpl->sample_rank_bias, "tts_sample_rank_bias");
         ggml_set_input(pimpl->sample_rank_bias);
-        ggml_tensor * selected_index = ggml_argmax(
-                ctx, ggml_mul(ctx, mask, pimpl->sample_rank_bias));
+        pimpl->sample_scores = ggml_mul(
+                ctx, mask, pimpl->sample_rank_bias);
+        ggml_tensor * selected_index =
+                ggml_argmax(ctx, pimpl->sample_scores);
 
         sampler_data.sampled = selected_index;
         if (sampler_data.candidates) {
@@ -563,6 +572,42 @@ bool tts_device_head::forward(
     if (selected_relative_token < 0 || selected_relative_token >= pimpl->vocab_size) {
         error = "TTS device sampler produced out-of-range token";
         return false;
+    }
+    if (std::getenv("OMNI_TTS_DEBUG_DUMP") && !pimpl->greedy) {
+        const int64_t n = ggml_nelements(pimpl->sample_probs);
+        std::vector<float> probs(n);
+        std::vector<float> cdf(n);
+        std::vector<float> mask(n);
+        std::vector<float> scores(n);
+        ggml_backend_tensor_get(
+                pimpl->sample_probs, probs.data(), 0,
+                probs.size() * sizeof(probs[0]));
+        ggml_backend_tensor_get(
+                pimpl->sample_cdf, cdf.data(), 0,
+                cdf.size() * sizeof(cdf[0]));
+        ggml_backend_tensor_get(
+                pimpl->sample_mask, mask.data(), 0,
+                mask.size() * sizeof(mask[0]));
+        ggml_backend_tensor_get(
+                pimpl->sample_scores, scores.data(), 0,
+                scores.size() * sizeof(scores[0]));
+        std::fprintf(
+                stderr,
+                "TTS_DEVICE_DEBUG uniform=%.9g selected=%d n=%lld\n",
+                step.uniform,
+                selected_relative_token,
+                static_cast<long long>(n));
+        for (int64_t i = 0; i < std::min<int64_t>(n, 32); ++i) {
+            std::fprintf(
+                    stderr,
+                    "TTS_DEVICE_DEBUG i=%lld p=%.9g cdf=%.9g mask=%.9g "
+                    "score=%.9g\n",
+                    static_cast<long long>(i),
+                    probs[i],
+                    cdf[i],
+                    mask[i],
+                    scores[i]);
+        }
     }
 
     selected_embedding.tensor = pimpl->embedding;
