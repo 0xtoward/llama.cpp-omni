@@ -331,8 +331,15 @@ void ggml_cann_cast_i64_to_i32(
     GGML_ASSERT(src->type == GGML_TYPE_I64);
     GGML_ASSERT(ggml_is_contiguous(src));
     int64_t dst_ne[1] = {ggml_nelements(src)};
+    size_t src_nb[1] = {sizeof(int64_t)};
     size_t dst_nb[1] = {sizeof(int32_t)};
-    acl_tensor_ptr acl_src = ggml_cann_create_tensor(src);
+    acl_tensor_ptr acl_src = ggml_cann_create_tensor(
+        src->data,
+        ACL_INT64,
+        sizeof(int64_t),
+        dst_ne,
+        src_nb,
+        1);
     acl_tensor_ptr acl_dst = ggml_cann_create_tensor(
         dst_data,
         ACL_INT32,
