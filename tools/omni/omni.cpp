@@ -11262,6 +11262,19 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                 // Copy tmp to a local string immediately to avoid issues with static string
                 std::string tmp_str(tmp);
                 response += tmp_str;
+                // OMNI_TEACHER_TOKENS_FILE defines decoder steps, whereas
+                // max_tgt_len counts user-visible tokens and the regular loop
+                // may overshoot it in 10-token TTS chunks. End the debug turn
+                // after the 32nd forced token so both lanes execute the same
+                // number of model forwards.
+                if (ctx_omni->token_trace.enabled()) {
+                    std::lock_guard<std::mutex> trace_lock(
+                        ctx_omni->token_trace_mtx);
+                    if (omni::token_trace::teacher_sequence_complete(
+                            ctx_omni->token_trace)) {
+                        llm_finish = true;
+                    }
+                }
                 fflush(stdout);
             }
             fflush(stdout);

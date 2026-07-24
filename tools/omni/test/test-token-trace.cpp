@@ -64,6 +64,8 @@ int main() {
         size_t index = 99;
         assert(omni::token_trace::next_teacher_token(debug, selected, index, error));
         assert(selected == i && index == static_cast<size_t>(i));
+        assert(omni::token_trace::teacher_sequence_complete(debug) ==
+               (i == 31));
     }
     int32_t exhausted = -1;
     size_t exhausted_index = 0;

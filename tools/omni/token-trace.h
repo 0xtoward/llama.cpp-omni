@@ -172,6 +172,11 @@ inline bool next_teacher_token(
     return true;
 }
 
+inline bool teacher_sequence_complete(const state & debug) {
+    return debug.teacher_enabled() &&
+           debug.teacher_index == debug.teacher_tokens.size();
+}
+
 inline std::vector<top_k_entry> compute_top_k(
         const float * logits,
         size_t count,
