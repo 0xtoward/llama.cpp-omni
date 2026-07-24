@@ -26,12 +26,14 @@
 #include "../ggml-impl.h"
 #include "../include/ggml-cann.h"
 #include "../include/ggml.h"
+#include "experiment-config.h"
 
 #include <acl/acl.h>
 #include <unistd.h>
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <cstdio>
 #include <functional>
 #include <iostream>
@@ -214,6 +216,63 @@ struct ggml_cann_pool_alloc {
 };
 
 #ifdef USE_ACL_GRAPH
+enum class ggml_cann_graph_miss_reason {
+    none,
+    cold,
+    node_count,
+    address,
+    op,
+    dtype,
+    shape,
+    stride,
+    op_params,
+};
+
+inline const char * ggml_cann_graph_miss_reason_name(ggml_cann_graph_miss_reason reason) {
+    switch (reason) {
+        case ggml_cann_graph_miss_reason::none:       return "none";
+        case ggml_cann_graph_miss_reason::cold:       return "cold";
+        case ggml_cann_graph_miss_reason::node_count: return "node_count";
+        case ggml_cann_graph_miss_reason::address:    return "address";
+        case ggml_cann_graph_miss_reason::op:         return "op";
+        case ggml_cann_graph_miss_reason::dtype:      return "dtype";
+        case ggml_cann_graph_miss_reason::shape:      return "shape";
+        case ggml_cann_graph_miss_reason::stride:     return "stride";
+        case ggml_cann_graph_miss_reason::op_params:  return "op_params";
+    }
+    return "invalid";
+}
+
+inline uint64_t ggml_cann_graph_hash_mix(uint64_t hash, uint64_t value) {
+    constexpr uint64_t fnv_prime = 1099511628211ULL;
+    hash ^= value;
+    hash *= fnv_prime;
+    return hash;
+}
+
+inline uint64_t ggml_cann_graph_fingerprint(const ggml_cgraph * cgraph) {
+    uint64_t hash = 1469598103934665603ULL;
+    hash = ggml_cann_graph_hash_mix(hash, static_cast<uint64_t>(cgraph->n_nodes));
+    for (int node_idx = 0; node_idx < cgraph->n_nodes; ++node_idx) {
+        const ggml_tensor * node = cgraph->nodes[node_idx];
+        hash = ggml_cann_graph_hash_mix(hash, reinterpret_cast<uintptr_t>(node->data));
+        hash = ggml_cann_graph_hash_mix(hash, static_cast<uint64_t>(node->op));
+        hash = ggml_cann_graph_hash_mix(hash, static_cast<uint64_t>(node->type));
+        for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+            hash = ggml_cann_graph_hash_mix(hash, static_cast<uint64_t>(node->ne[dim]));
+            hash = ggml_cann_graph_hash_mix(hash, static_cast<uint64_t>(node->nb[dim]));
+        }
+        for (int src = 0; src < GGML_MAX_SRC; ++src) {
+            hash = ggml_cann_graph_hash_mix(
+                hash, node->src[src] ? reinterpret_cast<uintptr_t>(node->src[src]->data) : 0);
+        }
+        for (size_t byte = 0; byte < GGML_MAX_OP_PARAMS; ++byte) {
+            hash = ggml_cann_graph_hash_mix(hash, node->op_params[byte]);
+        }
+    }
+    return hash;
+}
+
 struct ggml_graph_node_properties {
     // dst tensor
     void *    node_address;
@@ -240,54 +299,57 @@ struct ggml_graph_node_properties {
      * @param node The current ggml tensor node.
      * @return true if all fields match (excluding GGML_OP_VIEW); false otherwise.
      */
-    bool has_matching_properties(ggml_tensor * node) {
+    ggml_cann_graph_miss_reason mismatch_reason(const ggml_tensor * node) const {
         if (node->data != this->node_address && node->op != GGML_OP_VIEW) {
-            return false;
+            return ggml_cann_graph_miss_reason::address;
         }
 
         if (node->op != this->node_op) {
-            return false;
+            return ggml_cann_graph_miss_reason::op;
         }
 
         if (node->type != this->node_type) {
-            return false;
+            return ggml_cann_graph_miss_reason::dtype;
         }
 
         for (int i = 0; i < GGML_MAX_DIMS; i++) {
             if (node->ne[i] != this->ne[i]) {
-                return false;
+                return ggml_cann_graph_miss_reason::shape;
             }
             if (node->nb[i] != this->nb[i]) {
-                return false;
+                return ggml_cann_graph_miss_reason::stride;
             }
         }
 
         for (int i = 0; i < GGML_MAX_SRC; i++) {
             if (node->src[i]) {
                 if (node->src[i]->data != this->src_address[i] && node->op != GGML_OP_VIEW) {
-                    return false;
+                    return ggml_cann_graph_miss_reason::address;
                 }
 
                 if (node->src[i]->type != this->src_type[i]) {
-                    return false;
+                    return ggml_cann_graph_miss_reason::dtype;
                 }
 
                 for (int d = 0; d < GGML_MAX_DIMS; d++) {
                     if (node->src[i]->ne[d] != this->src_ne[i][d]) {
-                        return false;
+                        return ggml_cann_graph_miss_reason::shape;
                     }
                     if (node->src[i]->nb[d] != this->src_nb[i][d]) {
-                        return false;
+                        return ggml_cann_graph_miss_reason::stride;
                     }
                 }
             } else {
                 if (this->src_address[i] != nullptr) {
-                    return false;
+                    return ggml_cann_graph_miss_reason::address;
                 }
             }
         }
 
-        return memcmp(this->op_params, node->op_params, GGML_MAX_OP_PARAMS) == 0;
+        if (memcmp(this->op_params, node->op_params, GGML_MAX_OP_PARAMS) != 0) {
+            return ggml_cann_graph_miss_reason::op_params;
+        }
+        return ggml_cann_graph_miss_reason::none;
     }
 };
 
@@ -301,6 +363,7 @@ struct ggml_cann_graph {
     aclmdlRI graph = nullptr;
 
     std::vector<ggml_graph_node_properties> ggml_graph_properties;
+    uint64_t                                fingerprint = 0;
 
     /**
      * @brief Create a new CANN graph from a ggml computation graph.
@@ -322,6 +385,7 @@ struct ggml_cann_graph {
     static ggml_cann_graph * create_from_cgraph(ggml_cgraph * cgraph) {
         ggml_cann_graph * new_graph = new ggml_cann_graph();
         new_graph->ggml_graph_properties.resize(cgraph->n_nodes);
+        new_graph->fingerprint = ggml_cann_graph_fingerprint(cgraph);
 
         for (int node_idx = 0; node_idx < cgraph->n_nodes; ++node_idx) {
             ggml_tensor * node = cgraph->nodes[node_idx];
@@ -364,19 +428,26 @@ struct ggml_cann_graph {
      * @param cgraph The current ggml computation graph.
      * @return true if this CANN graph matches the ggml graph; false otherwise.
      */
-    bool matches_cgraph(ggml_cgraph * cgraph) {
+    ggml_cann_graph_miss_reason mismatch_reason(const ggml_cgraph * cgraph) const {
         if (this->ggml_graph_properties.size() != static_cast<size_t>(cgraph->n_nodes)) {
-            return false;
+            return ggml_cann_graph_miss_reason::node_count;
         }
 
         for (int i = 0; i < cgraph->n_nodes; ++i) {
-            if (!this->ggml_graph_properties[i].has_matching_properties(cgraph->nodes[i])) {
-                return false;
+            const auto reason = this->ggml_graph_properties[i].mismatch_reason(cgraph->nodes[i]);
+            if (reason != ggml_cann_graph_miss_reason::none) {
+                return reason;
             }
         }
 
-        return true;
+        return ggml_cann_graph_miss_reason::none;
     }
+};
+
+struct ggml_cann_graph_lookup {
+    bool                        found       = false;
+    ggml_cann_graph_miss_reason miss_reason = ggml_cann_graph_miss_reason::cold;
+    uint64_t                    fingerprint = 0;
 };
 
 /**
@@ -390,6 +461,10 @@ struct ggml_cann_graph_lru_cache {
     size_t capacity;                         /**< Maximum number of graphs in the cache. */
 
     std::list<ggml_cann_graph *> cache_list; /**< List storing cached graphs as raw pointers. */
+    uint64_t hits      = 0;
+    uint64_t misses    = 0;
+    uint64_t captures  = 0;
+    uint64_t evictions = 0;
 
     ggml_cann_graph_lru_cache() { capacity = parse_integer(get_env_as_lowercase("GGML_CANN_GRAPH_CACHE_CAPACITY").value_or("12")); }
 
@@ -404,8 +479,10 @@ struct ggml_cann_graph_lru_cache {
             ggml_cann_graph * old = cache_list.back();
             cache_list.pop_back();
             delete old;  // free the old graph
+            evictions++;
         }
         cache_list.push_front(new_node);
+        captures++;
     }
 
     /**
@@ -434,15 +511,26 @@ struct ggml_cann_graph_lru_cache {
      * @param cgraph The current ggml computation graph.
      * @return true if found; false otherwise.
      */
-    bool find_and_move_to_front(ggml_cgraph * cgraph) {
-        for (auto & graph_ptr : this->cache_list) {
-            if (graph_ptr->matches_cgraph(cgraph)) {
-                cache_list.remove(graph_ptr);
+    ggml_cann_graph_lookup find_and_move_to_front(ggml_cgraph * cgraph) {
+        ggml_cann_graph_lookup result;
+        result.fingerprint = ggml_cann_graph_fingerprint(cgraph);
+        for (auto iterator = cache_list.begin(); iterator != cache_list.end(); ++iterator) {
+            ggml_cann_graph * graph_ptr = *iterator;
+            const auto reason = graph_ptr->mismatch_reason(cgraph);
+            if (reason == ggml_cann_graph_miss_reason::none) {
+                cache_list.erase(iterator);
                 cache_list.push_front(graph_ptr);
-                return true;
+                result.found = true;
+                result.miss_reason = ggml_cann_graph_miss_reason::none;
+                hits++;
+                return result;
+            }
+            if (result.miss_reason == ggml_cann_graph_miss_reason::cold) {
+                result.miss_reason = reason;
             }
         }
-        return false;
+        misses++;
+        return result;
     }
 };
 #endif  // USE_ACL_GRAPH
@@ -565,6 +653,9 @@ struct ggml_backend_cann_context {
     ggml_cann_graph_lru_cache graph_lru_cache;
     bool                      acl_graph_mode = true;
 #endif
+    ggml_cann_experiment_config experiment_config;
+    uint64_t                experiment_step = 0;
+    uint64_t                experiment_add_rms_hits = 0;
     bool                   async_mode;
     // Rope Cache
     ggml_cann_rope_cache   rope_cache;
@@ -582,11 +673,59 @@ struct ggml_backend_cann_context {
         ggml_cann_set_device(device);
         description = aclrtGetSocName();
 
+        const bool legacy_graph_enabled =
+            parse_bool(get_env_as_lowercase("GGML_CANN_ACL_GRAPH").value_or("on"));
+        const bool legacy_add_rms_enabled =
+            parse_bool(get_env_as_lowercase("GGML_CANN_OPERATOR_FUSION").value_or(""));
+        const auto parsed = ggml_cann_parse_experiment_config(
+            get_env_as_lowercase("GGML_CANN_GRAPH_EXPERIMENT"),
+            get_env_as_lowercase("GGML_CANN_FUSION_EXPERIMENT"),
+            get_env_as_lowercase("GGML_CANN_LAYER_ENGINE"),
+            get_env_as_lowercase("GGML_CANN_EXPERIMENT_TRACE"),
+            legacy_graph_enabled,
+            legacy_add_rms_enabled);
+        if (!parsed) {
+            GGML_ABORT("%s", parsed.error.c_str());
+        }
+        experiment_config = parsed.config;
+
+        if (experiment_config.fusion != ggml_cann_fusion_experiment::none &&
+            experiment_config.fusion != ggml_cann_fusion_experiment::add_rms) {
+            GGML_ABORT(
+                "GGML_CANN_FUSION_EXPERIMENT=%s is parsed but not implemented; refusing silent fallback",
+                ggml_cann_experiment_name(experiment_config.fusion));
+        }
+        if (experiment_config.layer_engine != ggml_cann_layer_engine::ggml) {
+            GGML_ABORT(
+                "GGML_CANN_LAYER_ENGINE=%s is parsed but not implemented; refusing silent fallback",
+                ggml_cann_experiment_name(experiment_config.layer_engine));
+        }
+
 #ifdef USE_ACL_GRAPH
-        acl_graph_mode = parse_bool(get_env_as_lowercase("GGML_CANN_ACL_GRAPH").value_or("on"));
+        if (experiment_config.graph == ggml_cann_graph_experiment::decode_bucket ||
+            experiment_config.graph == ggml_cann_graph_experiment::layer_islands) {
+            GGML_ABORT(
+                "GGML_CANN_GRAPH_EXPERIMENT=%s is parsed but not implemented; refusing stock-graph fallback",
+                ggml_cann_experiment_name(experiment_config.graph));
+        }
+        acl_graph_mode = experiment_config.graph != ggml_cann_graph_experiment::off;
         GGML_LOG_INFO("%s: device %d execution mode is %s (%s)\n", __func__, device, acl_graph_mode ? "GRAPH" : "EAGER",
                       acl_graph_mode ? "acl graph enabled" : "acl graph disabled");
+#else
+        if (experiment_config.graph != ggml_cann_graph_experiment::off) {
+            GGML_ABORT(
+                "GGML_CANN_GRAPH_EXPERIMENT=%s requires a build with USE_ACL_GRAPH",
+                ggml_cann_experiment_name(experiment_config.graph));
+        }
 #endif
+        GGML_LOG_INFO(
+            "%s: device %d experiments graph=%s fusion=%s layer_engine=%s trace=%d\n",
+            __func__,
+            device,
+            ggml_cann_experiment_name(experiment_config.graph),
+            ggml_cann_experiment_name(experiment_config.fusion),
+            ggml_cann_experiment_name(experiment_config.layer_engine),
+            experiment_config.trace ? 1 : 0);
     }
 
     /**

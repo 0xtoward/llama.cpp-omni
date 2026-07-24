@@ -2258,6 +2258,33 @@ static bool ggml_cann_can_fuse(const struct ggml_cgraph *          cgraph,
     return false;
 }
 
+static const ggml_tensor * ggml_cann_find_graph_tensor(
+        const ggml_cgraph * cgraph, const char * name) {
+    for (int node_idx = 0; node_idx < cgraph->n_nodes; ++node_idx) {
+        const ggml_tensor * node = cgraph->nodes[node_idx];
+        if (std::strcmp(ggml_get_name(node), name) == 0) {
+            return node;
+        }
+        for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
+            const ggml_tensor * src = node->src[src_idx];
+            if (src && std::strcmp(ggml_get_name(src), name) == 0) {
+                return src;
+            }
+        }
+    }
+    return nullptr;
+}
+
+static int64_t ggml_cann_graph_token_count(const ggml_cgraph * cgraph) {
+    if (const ggml_tensor * tokens = ggml_cann_find_graph_tensor(cgraph, "inp_tokens")) {
+        return tokens->ne[0];
+    }
+    if (const ggml_tensor * embeddings = ggml_cann_find_graph_tensor(cgraph, "inp_embd")) {
+        return embeddings->ne[1];
+    }
+    return -1;
+}
+
 /**
  * @brief Evaluate the computation graph and optionally capture or execute it using CANN graph API.
  *
@@ -2282,7 +2309,9 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
 #endif  // USE_ACL_GRAPH
     // Only perform the graph execution if CANN graphs are not enabled, or we are capturing the graph.
     // With the use of CANN graphs, the execution will be performed by the graph launch.
-    static bool opt_fusion = parse_bool(get_env_as_lowercase("GGML_CANN_OPERATOR_FUSION").value_or(""));
+    const bool opt_fusion =
+        cann_ctx->experiment_config.fusion == ggml_cann_fusion_experiment::add_rms ||
+        cann_ctx->experiment_config.fusion == ggml_cann_fusion_experiment::all;
 
     if (!use_cann_graph || cann_graph_capture_required) {
         for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -2290,6 +2319,7 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
             if (opt_fusion) {
                 if (ggml_cann_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM })) {
                     ggml_cann_op_add_rms_norm_fused(*cann_ctx, node, cgraph->nodes[i + 1]);
+                    cann_ctx->experiment_add_rms_hits++;
                     i++;
                     continue;
                 }
@@ -2346,24 +2376,23 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
 
     // calculate rope cache for fist layer in current device.
     cann_ctx->rope_cache.cached = false;
+    cann_ctx->experiment_add_rms_hits = 0;
 
     bool graph_capture_required = false;
+    const int64_t n_tokens = ggml_cann_graph_token_count(cgraph);
+#ifdef USE_ACL_GRAPH
+    ggml_cann_graph_lookup graph_lookup;
+    graph_lookup.fingerprint = ggml_cann_graph_fingerprint(cgraph);
+#endif
 #ifdef USE_ACL_GRAPH
     bool use_cann_graph = true;
 
     static bool prefill_use_graph = parse_bool(get_env_as_lowercase("GGML_CANN_PREFILL_USE_GRAPH").value_or(""));
     if (!prefill_use_graph) {
-        // Do not use acl_graph for prefill.
-        for (int i = 0; i < cgraph->n_nodes; i++) {
-            ggml_tensor * node = cgraph->nodes[i];
-            // TODO: Optimize here. Currently, we can only
-            // get seq_len by FA's input.
-            if (node->op == GGML_OP_FLASH_ATTN_EXT) {
-                // Q -> src[0], shape: [B, S, N, D]
-                use_cann_graph = (node->src[0]->ne[1] == 1);
-                break;
-            }
-        }
+        // Capture only an explicitly identified one-token decode graph. This
+        // remains valid when FlashAttention is disabled; unknown graph types
+        // stay eager rather than accidentally capturing a prefill graph.
+        use_cann_graph = n_tokens == 1;
     }
 
     if (!cann_ctx->acl_graph_mode) {
@@ -2372,7 +2401,8 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
 
     if (use_cann_graph) {
         // If no matching graph is found, the graph needs to be recaptured.
-        graph_capture_required = !cann_ctx->graph_lru_cache.find_and_move_to_front(cgraph);
+        graph_lookup = cann_ctx->graph_lru_cache.find_and_move_to_front(cgraph);
+        graph_capture_required = !graph_lookup.found;
 
         if (graph_capture_required) {
             // If no matching graph is found, add a new ACL graph.
@@ -2397,6 +2427,47 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
     bool use_cann_graph = false;
 #endif  // USE_ACL_GRAPH
     evaluate_and_capture_cann_graph(cann_ctx, cgraph, use_cann_graph, graph_capture_required);
+
+    if (cann_ctx->experiment_config.trace) {
+        const char * graph_event = "eager";
+        const char * miss_reason = "none";
+        uint64_t fingerprint = 0;
+        uint64_t hits = 0;
+        uint64_t misses = 0;
+        uint64_t captures = 0;
+        uint64_t evictions = 0;
+#ifdef USE_ACL_GRAPH
+        fingerprint = graph_lookup.fingerprint;
+        hits = cann_ctx->graph_lru_cache.hits;
+        misses = cann_ctx->graph_lru_cache.misses;
+        captures = cann_ctx->graph_lru_cache.captures;
+        evictions = cann_ctx->graph_lru_cache.evictions;
+        if (use_cann_graph) {
+            graph_event = graph_capture_required ? "capture" : "hit";
+            miss_reason = graph_capture_required
+                ? ggml_cann_graph_miss_reason_name(graph_lookup.miss_reason)
+                : "none";
+        }
+#endif
+        GGML_LOG_INFO(
+            "CANN_EXPERIMENT_EVENT "
+            "{\"step\":%llu,\"stage\":\"%s\",\"m\":%lld,\"kv_length\":null,"
+            "\"kv_bucket\":null,\"graph_fingerprint\":\"%016llx\","
+            "\"graph_event\":\"%s\",\"miss_reason\":\"%s\","
+            "\"fusion_hits\":{\"add_rms\":%llu},"
+            "\"cache\":{\"hits\":%llu,\"misses\":%llu,\"captures\":%llu,\"evictions\":%llu}}\n",
+            static_cast<unsigned long long>(cann_ctx->experiment_step++),
+            n_tokens == 1 ? "decode" : "prefill_or_other",
+            static_cast<long long>(n_tokens),
+            static_cast<unsigned long long>(fingerprint),
+            graph_event,
+            miss_reason,
+            static_cast<unsigned long long>(cann_ctx->experiment_add_rms_hits),
+            static_cast<unsigned long long>(hits),
+            static_cast<unsigned long long>(misses),
+            static_cast<unsigned long long>(captures),
+            static_cast<unsigned long long>(evictions));
+    }
 
     return GGML_STATUS_SUCCESS;
 }
