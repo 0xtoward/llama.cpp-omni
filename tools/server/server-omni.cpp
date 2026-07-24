@@ -411,7 +411,11 @@ int main(int argc, char ** argv) {
     });
 
     // start server
-    svr.listen("0.0.0.0", params.port);
+    if (!svr.listen("0.0.0.0", params.port)) {
+        LOG_ERR("Omni HTTP server failed to listen on 0.0.0.0:%d\n", params.port);
+        llama_backend_free();
+        return 1;
+    }
 
     // cleanup
     {
