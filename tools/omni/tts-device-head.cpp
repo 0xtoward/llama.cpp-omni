@@ -413,13 +413,18 @@ bool tts_device_head::initialize(
         ggml_set_input(pimpl->sample_rank_bias);
         pimpl->sample_scores = ggml_mul(
                 ctx, mask, pimpl->sample_rank_bias);
+        // Keep the complete sampling chain alive until the sampled rank and
+        // vocabulary-id gather have both finished.  On CANN, allowing
+        // gallocr to recycle these small intermediates early can overwrite
+        // the top-k/top-p mask before the final gather.  Diagnostic dumps
+        // used to hide this by marking the same tensors as outputs.
+        ggml_set_output(pimpl->sample_probs);
+        ggml_set_output(pimpl->sample_cdf);
+        ggml_set_output(pimpl->sample_mask);
+        ggml_set_output(pimpl->sample_scores);
         ggml_tensor * selected_index =
                 ggml_argmax(ctx, pimpl->sample_scores);
         if (std::getenv("OMNI_TTS_DEBUG_DUMP")) {
-            ggml_set_output(pimpl->sample_probs);
-            ggml_set_output(pimpl->sample_cdf);
-            ggml_set_output(pimpl->sample_mask);
-            ggml_set_output(pimpl->sample_scores);
             if (pimpl->candidate_order) {
                 ggml_set_output(pimpl->candidate_order);
             }
