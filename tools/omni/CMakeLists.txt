@@ -217,6 +217,15 @@ if (LLAMA_BUILD_TESTS)
     )
     set_tests_properties(token2wav-backend-policy PROPERTIES LABELS "main;omni")
 
+    add_executable(test-omni-sampling-policy test/test-sampling-policy.cpp)
+    target_include_directories(test-omni-sampling-policy PRIVATE .)
+    target_compile_features(test-omni-sampling-policy PRIVATE cxx_std_17)
+    add_test(
+        NAME omni-sampling-policy
+        COMMAND test-omni-sampling-policy
+    )
+    set_tests_properties(omni-sampling-policy PROPERTIES LABELS "main;omni")
+
     add_test(
         NAME voxcpm2-cli-smoke
         COMMAND ${TARGET_VOXCPM2_CLI} --help

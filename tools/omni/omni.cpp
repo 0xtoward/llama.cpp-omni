@@ -4,6 +4,7 @@
 #include "omni.h"
 #include "token2wav/token2wav-impl.h"
 #include "token2wav/token2wav-backend-policy.h"
+#include "sampling-policy.h"
 #include "wav-chunk-utils.h"
 
 #include "llama.h"
@@ -1353,57 +1354,35 @@ static const char * llama_loop(struct omni_context * ctx_omni, common_params *pa
 // 🔧 [双工模式] 支持 listen_prob_scale 参数，增加 <|listen|> 的采样概率
 // 🔧 [双工模式] 支持 forbidden_token_ids，禁止采样 <|tts_pad|> 等 token
 static const char * sample_with_hidden_and_token(struct common_sampler * smpl, struct omni_context * ctx_omni, common_params* params, int * n_past, float *& hidden_states, llama_token & token_id) {
-    float * logits = llama_get_logits_ith(ctx_omni->ctx_llama, -1);
-    
-    // 🔧 [双工模式] 在采样前调整 logits
-    if (ctx_omni->duplex_mode) {
-        if (logits != nullptr) {
-            // 1. 调整 <|listen|> 的 logit（listen_prob_scale）
-            // listen_prob_scale > 1.0 会增加 <|listen|> 的概率，让模型更倾向于先听
-            if (ctx_omni->special_token_listen >= 0) {
-                // 使用 listen_prob_scale 调整 <|listen|> 的 logit
-                // 默认值 1.0 不改变，> 1.0 增加 listen 概率
-                // 这里我们使用加法而不是乘法，因为 logit 可能是负数
-                // 添加一个偏置值来增加 listen 的概率
-                // listen_prob_bias = log(listen_prob_scale) ≈ (listen_prob_scale - 1.0) for small values
-                float listen_bias = (ctx_omni->listen_prob_scale - 1.0f) * 2.0f;  // 放大效果
-                logits[ctx_omni->special_token_listen] += listen_bias;
-            }
-            
-            // 2. 🔧 [与 Python 对齐] 禁止采样 <|tts_pad|> token
-            // Python: self.forbidden_token_ids = [self.tts_pad_id] + list(bad_token_ids)
-            //         logits[:, self.forbidden_token_ids] = float("-inf")
-            // <|tts_pad|> 是填充 token，模型不应该主动生成它
-            // 如果不禁止，模型可能生成 <|speak|> → <|tts_pad|> → <|chunk_eos|>，导致无有效输出
-            if (ctx_omni->special_token_tts_pad >= 0) {
-                logits[ctx_omni->special_token_tts_pad] = -INFINITY;
-            }
-
-            // 3. Duplex 模式下对 <|turn_eos|> 应用长度惩罚，让 Python 透传的配置真正生效
-            if (ctx_omni->length_penalty != 1.0f && ctx_omni->special_token_turn_eos >= 0) {
-                float eos_logit = logits[ctx_omni->special_token_turn_eos];
-                if (eos_logit > 0) {
-                    logits[ctx_omni->special_token_turn_eos] = eos_logit / ctx_omni->length_penalty;
-                } else {
-                    logits[ctx_omni->special_token_turn_eos] = eos_logit * ctx_omni->length_penalty;
-                }
-            }
-        }
+    if (!omni_backend_sampling_controls_supported(
+            ctx_omni->backend_sampling_active,
+            ctx_omni->length_penalty,
+            ctx_omni->listen_prob_scale)) {
+        LOG_ERR("backend sampling cannot apply dynamic length/listen controls; "
+                "require length_penalty=1 and listen_prob_scale=1\n");
+        return nullptr;
     }
-    
-    // 🔧 [Length Penalty] 调整 EOS token 的 logit 值（单工模式）
-    // length_penalty > 1.0 会降低 EOS 概率，让模型生成更长的输出
-    if (!ctx_omni->duplex_mode && ctx_omni->length_penalty != 1.0f && ctx_omni->special_token_tts_eos >= 0) {
-        if (logits != nullptr) {
-            float eos_logit = logits[ctx_omni->special_token_tts_eos];
-            if (eos_logit > 0) {
-                // logit > 0 时，除以 length_penalty 来降低概率
-                logits[ctx_omni->special_token_tts_eos] = eos_logit / ctx_omni->length_penalty;
-            } else {
-                // logit <= 0 时，乘以 length_penalty 来降低概率
-                logits[ctx_omni->special_token_tts_eos] = eos_logit * ctx_omni->length_penalty;
-            }
-        }
+
+    // Raw logits are deliberately not copied to Host while backend sampling is
+    // active. Mutating llama_get_logits_ith() in that mode edits stale storage
+    // after the device has already selected the token.
+    if (!ctx_omni->backend_sampling_active) {
+        float * logits = llama_get_logits_ith(ctx_omni->ctx_llama, -1);
+        const llama_vocab * vocab =
+            llama_model_get_vocab(llama_get_model(ctx_omni->ctx_llama));
+        const omni_sampling_policy policy = {
+            ctx_omni->duplex_mode,
+            ctx_omni->listen_prob_scale,
+            ctx_omni->length_penalty,
+            ctx_omni->special_token_listen,
+            ctx_omni->special_token_tts_pad,
+            ctx_omni->special_token_turn_eos,
+            ctx_omni->special_token_tts_eos,
+        };
+        omni_apply_host_sampling_policy(
+            logits,
+            static_cast<size_t>(llama_vocab_n_tokens(vocab)),
+            policy);
     }
     
     const llama_token id = sample_token(smpl, ctx_omni);
@@ -4653,7 +4632,8 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
 
     const char * backend_sampling_env = std::getenv("OMNI_BACKEND_SAMPLING_GREEDY");
     if (backend_sampling_env && std::strcmp(backend_sampling_env, "1") == 0) {
-        if (ctx_omni->length_penalty != 1.0f || ctx_omni->listen_prob_scale != 1.0f) {
+        if (!omni_backend_sampling_controls_supported(
+                true, ctx_omni->length_penalty, ctx_omni->listen_prob_scale)) {
             LOG_ERR("OMNI_BACKEND_SAMPLING_GREEDY requires length_penalty=1 and listen_prob_scale=1\n");
             omni_free(ctx_omni);
             return nullptr;
