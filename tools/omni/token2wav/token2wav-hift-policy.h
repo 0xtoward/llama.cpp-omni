@@ -58,6 +58,10 @@ inline bool hift_buffer_spans_overlap(
     return lhs.address - rhs.address < rhs.bytes;
 }
 
+inline bool hift_plan_needs_workspace_scrub(uint64_t execution_count) {
+    return execution_count != 0;
+}
+
 inline hift_plan_phase hift_plan_phase_for(bool is_final, int64_t tc) {
     return is_final ? hift_plan_phase::final
                     : (tc == 0 ? hift_plan_phase::first : hift_plan_phase::steady);

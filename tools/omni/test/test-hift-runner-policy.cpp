@@ -47,6 +47,11 @@ int main() {
         CHECK(!hift_buffer_spans_overlap({0x0f00, 0x100}, input));
         CHECK(!hift_buffer_spans_overlap(input, {0x1080, 0}));
     }
+    {
+        CHECK(!hift_plan_needs_workspace_scrub(0));
+        CHECK(hift_plan_needs_workspace_scrub(1));
+        CHECK(hift_plan_needs_workspace_scrub(7));
+    }
 
     std::cout << "HiFT runner policy tests passed\n";
     return 0;

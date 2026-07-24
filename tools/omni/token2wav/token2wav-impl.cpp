@@ -6747,8 +6747,58 @@ struct voc_hg2_runner::persistent_state {
         ggml_tensor *           wave_t_b = nullptr;
         ggml_tensor *           source_t1_b = nullptr;
         ggml_tensor *           source_tail_flat = nullptr;
+        ggml_backend_buffer_t   compute_buffer = nullptr;
+        ggml_tensor *           const_window = nullptr;
+        ggml_tensor *           const_window_sq = nullptr;
+        ggml_tensor *           const_dft_cos_t = nullptr;
+        ggml_tensor *           const_dft_sin_t = nullptr;
+        ggml_tensor *           const_nyq_sign = nullptr;
+        ggml_tensor *           const_istft_ola_kernel = nullptr;
+        ggml_tensor *           const_harmonic_mul = nullptr;
         int64_t                 source_tail_len = 0;
         uint64_t                last_use = 0;
+        uint64_t                execution_count = 0;
+
+        bool upload_constants(voc_hg2_model * model) const {
+            if (!model || !model->hg2) {
+                return false;
+            }
+            const auto & dsp = model->hg2->gen.dsp;
+            const auto & sine = model->hg2->gen.source_nsf.sine_gen;
+            if (!const_window || !const_window_sq || !const_dft_cos_t ||
+                !const_dft_sin_t || !const_nyq_sign ||
+                !const_istft_ola_kernel || !const_harmonic_mul ||
+                dsp.host_window.empty() || dsp.host_window_sq.empty() ||
+                dsp.host_dft_cos_t.empty() || dsp.host_dft_sin_t.empty() ||
+                dsp.host_nyq_sign.empty() ||
+                dsp.host_istft_ola_kernel.empty() ||
+                sine.host_harmonic_mul.empty()) {
+                return false;
+            }
+            ggml_backend_tensor_set(
+                const_window, dsp.host_window.data(), 0,
+                dsp.host_window.size() * sizeof(float));
+            ggml_backend_tensor_set(
+                const_window_sq, dsp.host_window_sq.data(), 0,
+                dsp.host_window_sq.size() * sizeof(float));
+            ggml_backend_tensor_set(
+                const_dft_cos_t, dsp.host_dft_cos_t.data(), 0,
+                dsp.host_dft_cos_t.size() * sizeof(float));
+            ggml_backend_tensor_set(
+                const_dft_sin_t, dsp.host_dft_sin_t.data(), 0,
+                dsp.host_dft_sin_t.size() * sizeof(float));
+            ggml_backend_tensor_set(
+                const_nyq_sign, dsp.host_nyq_sign.data(), 0,
+                dsp.host_nyq_sign.size() * sizeof(float));
+            ggml_backend_tensor_set(
+                const_istft_ola_kernel,
+                dsp.host_istft_ola_kernel.data(), 0,
+                dsp.host_istft_ola_kernel.size() * sizeof(float));
+            ggml_backend_tensor_set(
+                const_harmonic_mul, sine.host_harmonic_mul.data(), 0,
+                sine.host_harmonic_mul.size() * sizeof(float));
+            return true;
+        }
 
         ~plan() {
             if (galloc) {
@@ -6981,6 +7031,21 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
                 }
             }
 
+            plan->compute_buffer = plan->wave_t_b->buffer;
+            plan->const_window = model->hg2->gen.dsp.window;
+            plan->const_window_sq = model->hg2->gen.dsp.window_sq;
+            plan->const_dft_cos_t = model->hg2->gen.dsp.dft_cos_t;
+            plan->const_dft_sin_t = model->hg2->gen.dsp.dft_sin_t;
+            plan->const_nyq_sign = model->hg2->gen.dsp.nyq_sign;
+            plan->const_istft_ola_kernel =
+                model->hg2->gen.dsp.istft_ola_kernel;
+            plan->const_harmonic_mul =
+                model->hg2->gen.source_nsf.sine_gen.harmonic_mul;
+            if (!plan->compute_buffer) {
+                std::fprintf(stderr, "voc_hg2_runner: persistent HiFT compute buffer unavailable\n");
+                return false;
+            }
+
             plan->source_tail_len =
                 std::min<int64_t>(kPersistentSourceCacheLen, plan->source_t1_b->ne[0]);
             plan->source_tail_flat = ggml_view_1d(
@@ -7027,8 +7092,7 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
                 omni::e2e_trace::span trace(
                     "hift", "constants_upload", ggml_backend_name(model->backend));
                 omni::flow::profile::ScopeTimer timer("voc.upload.constants");
-                if (!model->hg2->gen.dsp.hg_stft16_params_upload_consts(model->backend) ||
-                    !model->hg2->gen.source_nsf.sine_gen.hg_sine_gen2_upload_consts(model->backend)) {
+                if (!plan->upload_constants(model)) {
                     std::fprintf(stderr, "voc_hg2_runner: failed to upload persistent HiFT constants\n");
                     return false;
                 }
@@ -7082,6 +7146,26 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
                     "(expected Tc=%lld, active=%lld); refusing host fallback\n",
                     (long long) Tc,
                     (long long) state.active_source_len);
+                return false;
+            }
+        }
+
+        if (omni::flow::hift_plan_needs_workspace_scrub(
+                plan.execution_count)) {
+            // The current HiFT CANN graph is not replay-clean when its gallocr
+            // arena retains prior contents: the second execution of the same
+            // steady plan develops deterministic DC drift. Copy the source
+            // tail out first when producer and consumer are the same plan,
+            // then restore the arena to its first-execution state.
+            omni::e2e_trace::span trace(
+                "hift", "workspace_scrub", ggml_backend_name(model->backend));
+            omni::flow::profile::ScopeTimer timer("voc.workspace.scrub");
+            ggml_backend_buffer_clear(plan.compute_buffer, 0);
+            if (!plan.upload_constants(model)) {
+                std::fprintf(
+                    stderr,
+                    "voc_hg2_runner: failed to restore HiFT constants after "
+                    "workspace scrub\n");
                 return false;
             }
         }
@@ -7151,6 +7235,7 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
                 std::fprintf(stderr, "voc_hg2_runner: persistent HiFT graph compute failed\n");
                 return false;
             }
+            plan.execution_count++;
         }
 
         {
