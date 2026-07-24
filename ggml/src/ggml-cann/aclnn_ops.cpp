@@ -78,6 +78,7 @@
 #include <aclnnop/aclnn_sub.h>
 #include <aclnnop/aclnn_sum.h>
 #include <aclnnop/aclnn_threshold.h>
+#include <aclnnop/aclnn_topk.h>
 #include <aclnnop/aclnn_tril.h>
 #include <aclnnop/aclnn_triangular_solve.h>
 #include <aclnnop/aclnn_triu.h>
@@ -705,6 +706,57 @@ void ggml_cann_argsort(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     GGML_CANN_CALL_ACLNN_OP(ctx, Argsort, acl_src.get(), -1, (order == GGML_SORT_ORDER_DESC ? true : false),
                             tmp_tensor.get());
     GGML_CANN_CALL_ACLNN_OP(ctx, Cast, tmp_tensor.get(), ggml_cann_type_mapping(dst->type), acl_dst.get());
+}
+
+void ggml_cann_top_k(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
+    ggml_tensor * src = dst->src[0];
+
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(src->type == GGML_TYPE_F32 || src->type == GGML_TYPE_F16 ||
+                src->type == GGML_TYPE_BF16);
+    GGML_ASSERT(dst->ne[0] > 0 && dst->ne[0] <= src->ne[0]);
+    for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+        GGML_ASSERT(dst->ne[d] == src->ne[d]);
+    }
+
+    const int64_t k = dst->ne[0];
+    const int64_t n = ggml_nelements(dst);
+
+    size_t values_nb[GGML_MAX_DIMS];
+    values_nb[0] = ggml_type_size(src->type);
+    for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+        values_nb[d] = values_nb[d - 1] *
+                       static_cast<size_t>(dst->ne[d - 1]);
+    }
+
+    size_t indices_nb[GGML_MAX_DIMS];
+    indices_nb[0] = sizeof(int64_t);
+    for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+        indices_nb[d] = indices_nb[d - 1] *
+                        static_cast<size_t>(dst->ne[d - 1]);
+    }
+
+    ggml_cann_pool_alloc values_allocator(
+            ctx.pool(), static_cast<size_t>(n) * ggml_type_size(src->type));
+    ggml_cann_pool_alloc indices_allocator(
+            ctx.pool(), static_cast<size_t>(n) * sizeof(int64_t));
+
+    acl_tensor_ptr acl_src = ggml_cann_create_tensor(src);
+    acl_tensor_ptr acl_values = ggml_cann_create_tensor(
+            values_allocator.get(), ggml_cann_type_mapping(src->type),
+            ggml_type_size(src->type), dst->ne, values_nb, GGML_MAX_DIMS);
+    acl_tensor_ptr acl_indices = ggml_cann_create_tensor(
+            indices_allocator.get(), ACL_INT64, sizeof(int64_t),
+            dst->ne, indices_nb, GGML_MAX_DIMS);
+    acl_tensor_ptr acl_dst = ggml_cann_create_tensor(dst);
+
+    // ggml ne[0] is the last dimension after the ACL tensor dimension
+    // reversal. TOP_K requires descending, sorted vocabulary indices.
+    GGML_CANN_CALL_ACLNN_OP(
+            ctx, Topk, acl_src.get(), k, -1, true, true,
+            acl_values.get(), acl_indices.get());
+    GGML_CANN_CALL_ACLNN_OP(
+            ctx, Cast, acl_indices.get(), ACL_INT32, acl_dst.get());
 }
 
 void ggml_cann_norm(ggml_backend_cann_context & ctx, ggml_tensor * dst) {

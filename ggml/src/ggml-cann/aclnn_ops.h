@@ -180,6 +180,14 @@ void ggml_cann_scale(ggml_backend_cann_context & ctx, ggml_tensor * dst);
 void ggml_cann_argsort(ggml_backend_cann_context & ctx, ggml_tensor * dst);
 
 /**
+ * @brief Selects the descending top-k indices along ggml dimension 0.
+ *
+ * @param ctx The CANN context used for operations.
+ * @param dst I32 destination tensor. dst->op is `GGML_OP_TOP_K`.
+ */
+void ggml_cann_top_k(ggml_backend_cann_context & ctx, ggml_tensor * dst);
+
+/**
  * @brief   Computes the Layer Normalization for a ggml tensor using the CANN
  *          backend.
  *

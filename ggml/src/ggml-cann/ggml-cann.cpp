@@ -1982,6 +1982,9 @@ static bool ggml_cann_compute_forward(ggml_backend_cann_context & ctx, struct gg
         case GGML_OP_ARGSORT:
             ggml_cann_argsort(ctx, dst);
             break;
+        case GGML_OP_TOP_K:
+            ggml_cann_top_k(ctx, dst);
+            break;
         case GGML_OP_ARGMAX:
             ggml_cann_argmax(ctx, dst);
             break;
@@ -2987,6 +2990,7 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
         case GGML_OP_DIAG_MASK_INF:
         case GGML_OP_SUM_ROWS:
         case GGML_OP_ARGSORT:
+        case GGML_OP_TOP_K:
         case GGML_OP_ACC:
         case GGML_OP_SET:
         case GGML_OP_GROUP_NORM:

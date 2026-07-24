@@ -110,7 +110,6 @@ struct tts_device_head::impl {
     ggml_tensor * eos_id = nullptr;
     ggml_tensor * uniform = nullptr;
     ggml_tensor * top_p_floor_bias = nullptr;
-    ggml_tensor * top_k_keep_mask = nullptr;
     ggml_tensor * sample_rank_bias = nullptr;
     ggml_tensor * sample_probs = nullptr;
     ggml_tensor * sample_cdf = nullptr;
@@ -339,25 +338,33 @@ bool tts_device_head::initialize(
                     ctx, sampler_data.logits, 1, vocab_size);
             ggml_tensor * probs_2d = ggml_reshape_2d(
                     ctx, full_probs, 1, vocab_size);
-            // CANN has ARGSORT but no GGML_OP_TOP_K implementation. Keep the
-            // full sorted vocabulary and mask ranks >= K instead of creating
-            // a compact view; this avoids an allocator alias observed with
-            // SET_ROWS inputs on the CPU reference backend.
-            ggml_tensor * full_order =
-                    ggml_argsort(ctx, sampler_data.logits, GGML_SORT_ORDER_DESC);
-            pimpl->candidate_order = full_order;
-            // The sorted indices are consumed twice by the probability path
-            // and once more after sampling to map the selected rank back to a
-            // vocabulary id.  Keep the tiny I32 vector live for the complete
-            // graph.  Without this output fence gallocr can reuse its storage
-            // after the first two GET_ROWS nodes; OMNI_TTS_DEBUG_DUMP used to
-            // hide that lifetime bug by marking the tensor as an output only
-            // in diagnostic runs.
+            // Select a compact, sorted candidate set on device. The CANN
+            // backend maps this to aclnnTopk, avoiding a full-vocabulary
+            // ARGSORT and the fragile lifetime of its 6562-element index
+            // buffer.
+            ggml_tensor * top_k_indices =
+                    ggml_top_k(ctx, sampler_data.logits, top_k);
+            ggml_tensor * top_k_logits = ggml_reshape_1d(
+                    ctx, ggml_get_rows(
+                            ctx, logits_2d, top_k_indices), top_k);
+            // GGML_OP_TOP_K intentionally does not guarantee rank order
+            // across backends. Sort only the compact K-vector, then map the
+            // local ranks back to vocabulary ids.
+            ggml_tensor * compact_order =
+                    ggml_argsort(
+                            ctx, top_k_logits, GGML_SORT_ORDER_DESC);
+            ggml_tensor * top_k_indices_2d =
+                    ggml_reshape_2d(ctx, top_k_indices, 1, top_k);
+            pimpl->candidate_order = ggml_reshape_1d(
+                    ctx, ggml_get_rows(
+                            ctx, top_k_indices_2d, compact_order), top_k);
             ggml_set_output(pimpl->candidate_order);
             ggml_tensor * sorted_logits = ggml_reshape_1d(
-                    ctx, ggml_get_rows(ctx, logits_2d, full_order), vocab_size);
+                    ctx, ggml_get_rows(
+                            ctx, logits_2d, pimpl->candidate_order), top_k);
             ggml_tensor * sorted_probs = ggml_reshape_1d(
-                    ctx, ggml_get_rows(ctx, probs_2d, full_order), vocab_size);
+                    ctx, ggml_get_rows(
+                            ctx, probs_2d, pimpl->candidate_order), top_k);
 
             // CPU keeps candidate i when it belongs to min_keep or when the
             // cumulative probability *before* i is still below top_p.
@@ -370,21 +377,15 @@ bool tts_device_head::initialize(
                     ggml_scale(ctx, cdf_before, -1.0f);
             pimpl->top_p_floor_bias =
                     ggml_new_tensor_1d(
-                            input_ctx, GGML_TYPE_F32, vocab_size);
-            pimpl->top_k_keep_mask =
-                    ggml_new_tensor_1d(
-                            input_ctx, GGML_TYPE_F32, vocab_size);
+                            input_ctx, GGML_TYPE_F32, top_k);
             ggml_set_name(pimpl->top_p_floor_bias, "tts_top_p_floor_bias");
-            ggml_set_name(pimpl->top_k_keep_mask, "tts_top_k_keep_mask");
             ggml_set_input(pimpl->top_p_floor_bias);
-            ggml_set_input(pimpl->top_k_keep_mask);
             cdf_scaled = ggml_add(ctx, cdf_scaled, pimpl->top_p_floor_bias);
-            ggml_tensor * keep_mask = ggml_mul(
-                    ctx, ggml_step(ctx, cdf_scaled), pimpl->top_k_keep_mask);
+            ggml_tensor * keep_mask = ggml_step(ctx, cdf_scaled);
 
             sampler_data.logits =
                     ggml_add(ctx, sorted_logits, ggml_log(ctx, keep_mask));
-            sampler_data.candidates = full_order;
+            sampler_data.candidates = pimpl->candidate_order;
         }
 
         // Reproduce the legacy CPU sampler with a caller-provided float
@@ -480,7 +481,7 @@ bool tts_device_head::initialize(
     if (!greedy) {
         const int32_t eos = vocab_size - 1;
         ggml_backend_tensor_set(pimpl->eos_id, &eos, 0, sizeof(eos));
-        const int64_t n_candidates = vocab_size;
+        const int64_t n_candidates = apply_top_k_p ? top_k : vocab_size;
         std::vector<float> rank_bias(n_candidates);
         for (int64_t i = 0; i < n_candidates; ++i) {
             rank_bias[i] = static_cast<float>(n_candidates - i);
@@ -490,20 +491,14 @@ bool tts_device_head::initialize(
                 rank_bias.data(), 0,
                 rank_bias.size() * sizeof(rank_bias[0]));
         if (apply_top_k_p) {
-            std::vector<float> floor_bias(vocab_size, top_p);
-            std::vector<float> top_k_mask(vocab_size, 0.0f);
+            std::vector<float> floor_bias(top_k, top_p);
             for (int32_t i = 0; i < min_keep; ++i) {
                 floor_bias[i] = std::numeric_limits<float>::infinity();
             }
-            std::fill_n(top_k_mask.begin(), top_k, 1.0f);
             ggml_backend_tensor_set(
                     pimpl->top_p_floor_bias,
                     floor_bias.data(), 0,
                     floor_bias.size() * sizeof(floor_bias[0]));
-            ggml_backend_tensor_set(
-                    pimpl->top_k_keep_mask,
-                    top_k_mask.data(), 0,
-                    top_k_mask.size() * sizeof(top_k_mask[0]));
         }
     }
     LOG_INF("TTS device head: initialized backend=%s hidden=%d vocab=%d sampler=%s "
