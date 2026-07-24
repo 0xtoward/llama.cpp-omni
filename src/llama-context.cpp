@@ -924,6 +924,9 @@ bool llama_context::get_embeddings_device_ith(int32_t i, llama_device_tensor * o
         embeddings_device_row_view.ne[1] = 1;
         for (int d = 2; d < GGML_MAX_DIMS; ++d) {
             embeddings_device_row_view.ne[d] = 1;
+            embeddings_device_row_view.nb[d] =
+                    embeddings_device_row_view.nb[d - 1] *
+                    static_cast<size_t>(embeddings_device_row_view.ne[d - 1]);
         }
         embeddings_device_row_view.view_src = t_embd;
         embeddings_device_row_view.view_offs =
