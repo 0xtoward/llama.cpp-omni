@@ -382,6 +382,12 @@ bool tts_device_head::initialize(
                 ctx, mask, pimpl->sample_rank_bias);
         ggml_tensor * selected_index =
                 ggml_argmax(ctx, pimpl->sample_scores);
+        if (std::getenv("OMNI_TTS_DEBUG_DUMP")) {
+            ggml_set_output(pimpl->sample_probs);
+            ggml_set_output(pimpl->sample_cdf);
+            ggml_set_output(pimpl->sample_mask);
+            ggml_set_output(pimpl->sample_scores);
+        }
 
         sampler_data.sampled = selected_index;
         if (sampler_data.candidates) {
