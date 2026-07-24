@@ -94,6 +94,8 @@ struct tts_device_head::impl {
 
     ggml_context_ptr weight_ctx;
     ggml_backend_buffer_ptr weight_buffer;
+    ggml_context_ptr input_ctx;
+    ggml_backend_buffer_ptr input_buffer;
     ggml_context_ptr compute_ctx;
     ggml_gallocr_t allocator = nullptr;
 
@@ -256,7 +258,19 @@ bool tts_device_head::initialize(
     }
 
     ggml_context * ctx = pimpl->compute_ctx.get();
-    pimpl->hidden_input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden_size, 1);
+    pimpl->input_ctx.reset(ggml_init({
+        /*.mem_size   =*/ 16 * ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    }));
+    if (!pimpl->input_ctx) {
+        error = "failed to create TTS head persistent input context";
+        reset();
+        return false;
+    }
+    ggml_context * input_ctx = pimpl->input_ctx.get();
+    pimpl->hidden_input = ggml_new_tensor_2d(
+            input_ctx, GGML_TYPE_F32, hidden_size, 1);
     ggml_set_input(pimpl->hidden_input);
 
     ggml_tensor * logits = ggml_mul_mat(ctx, pimpl->head_weight, pimpl->hidden_input);
@@ -264,11 +278,16 @@ bool tts_device_head::initialize(
     logits = ggml_reshape_1d(ctx, logits, vocab_size);
 
     if (!greedy) {
-        pimpl->recent_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, repetition_window);
-        pimpl->penalty_neg = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, repetition_window);
-        pimpl->penalty_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, repetition_window);
-        pimpl->eos_bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
-        pimpl->eos_id = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        pimpl->recent_ids = ggml_new_tensor_1d(
+                input_ctx, GGML_TYPE_I32, repetition_window);
+        pimpl->penalty_neg = ggml_new_tensor_1d(
+                input_ctx, GGML_TYPE_F32, repetition_window);
+        pimpl->penalty_pos = ggml_new_tensor_1d(
+                input_ctx, GGML_TYPE_F32, repetition_window);
+        pimpl->eos_bias = ggml_new_tensor_1d(
+                input_ctx, GGML_TYPE_F32, 1);
+        pimpl->eos_id = ggml_new_tensor_1d(
+                input_ctx, GGML_TYPE_I32, 1);
         ggml_set_name(pimpl->recent_ids, "tts_recent_ids");
         ggml_set_name(pimpl->penalty_neg, "tts_penalty_neg");
         ggml_set_name(pimpl->penalty_pos, "tts_penalty_pos");
@@ -340,9 +359,11 @@ bool tts_device_head::initialize(
             ggml_tensor * cdf_scaled =
                     ggml_scale_bias(ctx, cdf_before, -1.0f, top_p);
             pimpl->top_p_floor_bias =
-                    ggml_new_tensor_1d(ctx, GGML_TYPE_F32, vocab_size);
+                    ggml_new_tensor_1d(
+                            input_ctx, GGML_TYPE_F32, vocab_size);
             pimpl->top_k_keep_mask =
-                    ggml_new_tensor_1d(ctx, GGML_TYPE_F32, vocab_size);
+                    ggml_new_tensor_1d(
+                            input_ctx, GGML_TYPE_F32, vocab_size);
             ggml_set_name(pimpl->top_p_floor_bias, "tts_top_p_floor_bias");
             ggml_set_name(pimpl->top_k_keep_mask, "tts_top_k_keep_mask");
             ggml_set_input(pimpl->top_p_floor_bias);
@@ -358,7 +379,8 @@ bool tts_device_head::initialize(
 
         // Reproduce the legacy CPU sampler with a caller-provided float
         // uniform. The large probability/logit tensors never leave device.
-        pimpl->uniform = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        pimpl->uniform = ggml_new_tensor_1d(
+                input_ctx, GGML_TYPE_F32, 1);
         ggml_set_name(pimpl->uniform, "tts_sampling_uniform");
         ggml_set_input(pimpl->uniform);
 
@@ -375,7 +397,8 @@ bool tts_device_head::initialize(
         // This also avoids the unsupported F32 -> I32 CPY/cast path.
         const int64_t n_candidates = ggml_nelements(mask);
         pimpl->sample_rank_bias =
-                ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_candidates);
+                ggml_new_tensor_1d(
+                        input_ctx, GGML_TYPE_F32, n_candidates);
         ggml_set_name(pimpl->sample_rank_bias, "tts_sample_rank_bias");
         ggml_set_input(pimpl->sample_rank_bias);
         pimpl->sample_scores = ggml_mul(
@@ -422,6 +445,13 @@ bool tts_device_head::initialize(
         }
     }
 
+    pimpl->input_buffer.reset(
+            ggml_backend_alloc_ctx_tensors(input_ctx, backend));
+    if (!pimpl->input_buffer) {
+        error = "failed to allocate persistent TTS device-head inputs";
+        reset();
+        return false;
+    }
     pimpl->allocator = ggml_gallocr_new(buft);
     if (!pimpl->allocator || !ggml_gallocr_alloc_graph(pimpl->allocator, pimpl->graph)) {
         error = "failed to allocate persistent TTS device head graph";
