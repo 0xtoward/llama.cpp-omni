@@ -96,13 +96,18 @@ static TestModelPaths resolve_model_paths(const std::string & llm_path) {
 static void duplex_test_case(struct omni_context * ctx_omni,
                              const std::string & data_path_prefix,
                              int cnt,
-                             int stream_interval_ms) {
+                             int stream_interval_ms,
+                             int fixture_period) {
     printf("\n=== Duplex test: %d chunks, interval=%dms ===\n", cnt, stream_interval_ms);
+    if (fixture_period > 0) {
+        printf("  fixture replay period: %d chunks\n", fixture_period);
+    }
 
     // 准备 N 个 chunk 的 (audio, image) 文件路径
     std::vector<OmniDuplexFrame> frames(cnt);
     for (int il = 0; il < cnt; ++il) {
-        char idx[16]; snprintf(idx, sizeof(idx), "%04d", il);
+        const int fixture_index = fixture_period > 0 ? il % fixture_period : il;
+        char idx[16]; snprintf(idx, sizeof(idx), "%04d", fixture_index);
         frames[il].aud_fname = data_path_prefix + idx + ".wav";
         std::string img = data_path_prefix + idx + ".jpg";
         if (file_exists(img)) frames[il].img_fname = img;
@@ -190,6 +195,7 @@ static void show_usage(const char * prog_name) {
         "  --vision-coreml <p>   CoreML/ANE 模型路径 (.mlmodelc)；--vision-backend=coreml 时\n"
         "                        若未指定则默认 <llm 同级目录>/vision/coreml_minicpmo45_vit_all_f16.mlmodelc\n"
         "  --test <prefix> <n> 指定测试数据前缀和 chunk 数量\n"
+        "  --fixture-period <n>  循环复用前n个fixture；用于120-chunk和长context实验\n"
         "  --stream-interval <ms>  push frame 的最小间隔 (默认 0=背靠背压测；\n"
         "                          设为 1000 模拟真实 MiniCPM-o 流式输入)\n"
         "  -o <dir>            输出目录 (默认: ./tools/omni/output)\n"
@@ -221,6 +227,7 @@ int main(int argc, char ** argv) {
     bool use_tts = true;
     bool run_test = false;
     int  stream_interval_ms = 0;  // 0 = 背靠背（压测）；真实流式建议 1000
+    int  fixture_period = 0;      // 0 = 不循环；正数时按 period 循环fixture
     std::string test_prefix;
     int test_count = 0;
     std::string token2wav_device = "gpu";
@@ -264,6 +271,13 @@ int main(int argc, char ** argv) {
         }
         else if (arg == "--stream-interval" && i + 1 < argc) {
             stream_interval_ms = std::atoi(argv[++i]);
+        }
+        else if (arg == "--fixture-period" && i + 1 < argc) {
+            fixture_period = std::atoi(argv[++i]);
+            if (fixture_period <= 0) {
+                fprintf(stderr, "Error: --fixture-period must be positive\n");
+                return 1;
+            }
         }
         else {
             fprintf(stderr, "Unknown argument: %s\n", arg.c_str());
@@ -354,7 +368,8 @@ int main(int argc, char ** argv) {
     duplex_test_case(ctx_omni,
                      run_test ? test_prefix : default_prefix,
                      run_test ? test_count  : 2,
-                     stream_interval_ms);
+                     stream_interval_ms,
+                     fixture_period);
 
     // 等所有 speak 帧的 audio 文件落盘后再销毁；omni_free 会处理后续所有线程 join。
     omni_duplex_drain_tts_audio(ctx_omni);
