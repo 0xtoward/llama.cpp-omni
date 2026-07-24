@@ -357,7 +357,7 @@ bool tts_device_head::initialize(
             ggml_tensor * cdf_before =
                     ggml_sub(ctx, ggml_cumsum(ctx, sorted_probs), sorted_probs);
             ggml_tensor * cdf_scaled =
-                    ggml_scale_bias(ctx, cdf_before, -1.0f, top_p);
+                    ggml_scale(ctx, cdf_before, -1.0f);
             pimpl->top_p_floor_bias =
                     ggml_new_tensor_1d(
                             input_ctx, GGML_TYPE_F32, vocab_size);
@@ -472,7 +472,7 @@ bool tts_device_head::initialize(
                 rank_bias.data(), 0,
                 rank_bias.size() * sizeof(rank_bias[0]));
         if (apply_top_k_p) {
-            std::vector<float> floor_bias(vocab_size, 0.0f);
+            std::vector<float> floor_bias(vocab_size, top_p);
             std::vector<float> top_k_mask(vocab_size, 0.0f);
             for (int32_t i = 0; i < min_keep; ++i) {
                 floor_bias[i] = std::numeric_limits<float>::infinity();
