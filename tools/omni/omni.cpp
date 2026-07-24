@@ -9922,6 +9922,7 @@ static bool duplex_do_decode(omni_context * ctx_omni, common_params * params,
             tmp = llama_loop_with_hidden_and_token(
                 ctx_omni, params, ctx_omni->ctx_sampler,
                 ctx_omni->n_past, hidden_states, sampled_token);
+            std::unique_ptr<float, decltype(&std::free)> hidden_states_guard(hidden_states, &std::free);
 
             total_tokens_generated++;
 
@@ -10924,6 +10925,7 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
                     // 使用新函数获取token文本、hidden state和token ID
                     tmp = llama_loop_with_hidden_and_token(ctx_omni, ctx_omni->params, ctx_omni->ctx_sampler, ctx_omni->n_past, hidden_states, sampled_token);
                 }
+                std::unique_ptr<float, decltype(&std::free)> hidden_states_guard(hidden_states, &std::free);
                 
                 total_tokens_generated++;
                 
