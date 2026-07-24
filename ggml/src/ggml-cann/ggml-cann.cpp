@@ -2240,13 +2240,35 @@ static void ggml_backend_cann_synchronize(ggml_backend_t backend) {
 static bool ggml_cann_can_fuse(const struct ggml_cgraph *          cgraph,
                                int                                 node_idx,
                                std::initializer_list<enum ggml_op> ops) {
-    if (!ggml_can_fuse(cgraph, node_idx, ops)) {
-        return false;
-    }
-
     // CANN backend supports fusing ADD + RMS_NORM operations
     if ((ops.size() == 2) && ops.begin()[0] == GGML_OP_ADD && ops.begin()[1] == GGML_OP_RMS_NORM) {
+        if (node_idx + 1 >= cgraph->n_nodes) {
+            return false;
+        }
         ggml_tensor * add_node = cgraph->nodes[node_idx];
+        ggml_tensor * rms_node = cgraph->nodes[node_idx + 1];
+        if (add_node->op != GGML_OP_ADD || rms_node->op != GGML_OP_RMS_NORM ||
+            (add_node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+            (rms_node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+            add_node->src[0] == nullptr ||
+            add_node->src[1] == nullptr ||
+            rms_node->src[0] != add_node ||
+            add_node->view_src != nullptr ||
+            rms_node->view_src != nullptr) {
+            return false;
+        }
+
+        // Unlike the generic matcher, AddRmsNorm may safely accept an ADD
+        // result with multiple consumers: the fused operator writes both the
+        // normalized output and the original ADD output (xOut). Qwen3 keeps
+        // that ADD result for the following residual connection.
+        if (!ggml_are_same_shape(add_node, rms_node) ||
+            add_node->type != rms_node->type ||
+            add_node->src[0]->type != add_node->type ||
+            add_node->src[1]->type != add_node->type) {
+            return false;
+        }
+
         // TODO: support broadcast for ADD + RMS_NORM
         if (add_node->src[0]->ne[0] != add_node->src[1]->ne[0] || add_node->src[0]->ne[1] != add_node->src[1]->ne[1] ||
             add_node->src[0]->ne[2] != add_node->src[1]->ne[2] || add_node->src[0]->ne[3] != add_node->src[1]->ne[3]) {
@@ -2255,7 +2277,7 @@ static bool ggml_cann_can_fuse(const struct ggml_cgraph *          cgraph,
         return true;
     }
 
-    return false;
+    return ggml_can_fuse(cgraph, node_idx, ops);
 }
 
 static const ggml_tensor * ggml_cann_find_graph_tensor(
