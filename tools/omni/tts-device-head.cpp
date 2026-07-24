@@ -116,6 +116,7 @@ struct tts_device_head::impl {
     ggml_tensor * sample_cdf = nullptr;
     ggml_tensor * sample_mask = nullptr;
     ggml_tensor * sample_scores = nullptr;
+    ggml_tensor * candidate_order = nullptr;
     ggml_tensor * sampled = nullptr;
     ggml_tensor * embedding = nullptr;
     ggml_cgraph * graph = nullptr;
@@ -344,6 +345,7 @@ bool tts_device_head::initialize(
             // SET_ROWS inputs on the CPU reference backend.
             ggml_tensor * full_order =
                     ggml_argsort(ctx, sampler_data.logits, GGML_SORT_ORDER_DESC);
+            pimpl->candidate_order = full_order;
             ggml_tensor * sorted_logits = ggml_reshape_1d(
                     ctx, ggml_get_rows(ctx, logits_2d, full_order), vocab_size);
             ggml_tensor * sorted_probs = ggml_reshape_1d(
@@ -410,6 +412,9 @@ bool tts_device_head::initialize(
             ggml_set_output(pimpl->sample_cdf);
             ggml_set_output(pimpl->sample_mask);
             ggml_set_output(pimpl->sample_scores);
+            if (pimpl->candidate_order) {
+                ggml_set_output(pimpl->candidate_order);
+            }
         }
 
         sampler_data.sampled = selected_index;
@@ -643,6 +648,21 @@ bool tts_device_head::forward(
                     cdf[i],
                     mask[i],
                     scores[i]);
+        }
+        if (pimpl->candidate_order) {
+            std::vector<int32_t> order(
+                    ggml_nelements(pimpl->candidate_order));
+            ggml_backend_tensor_get(
+                    pimpl->candidate_order,
+                    order.data(), 0,
+                    order.size() * sizeof(order[0]));
+            std::fprintf(stderr, "TTS_DEVICE_DEBUG order=");
+            for (int64_t i = 0; i < std::min<int64_t>(
+                     static_cast<int64_t>(order.size()), 32); ++i) {
+                std::fprintf(
+                        stderr, "%s%d", i ? "," : "", order[i]);
+            }
+            std::fprintf(stderr, "\n");
         }
     }
 
