@@ -288,6 +288,11 @@ private:
     // not copy it to the host-side embd buffer.
     bool embeddings_device_only = false;
 
+    // Borrowed single-row view into the most recent device embedding output.
+    // Its storage belongs to the graph tensor and remains valid only until the
+    // next context execution.
+    ggml_tensor embeddings_device_row_view = {};
+
     // hidden state before the final output norm (2-dimensional array: [n_outputs][n_embd])
     // populated only when cparams.embeddings_pre_norm is enabled and the model graph
     // sets llm_graph_result::t_h_pre_norm

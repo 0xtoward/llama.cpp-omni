@@ -120,8 +120,9 @@ struct llama_device_tensor {
 // nullptr while this mode is active.
 LLAMA_API void llama_set_embeddings_device_only(struct llama_context * ctx, bool value);
 
-// Return a borrowed handle for an M=1 embedding output. This deliberately
-// fails for multi-row outputs so callers cannot silently consume the wrong row.
+// Return a borrowed handle for one row of the latest device embedding output.
+// The returned metadata view and its graph-owned storage are valid only until
+// the context executes another graph. Passing -1 selects the final live row.
 LLAMA_API bool llama_get_embeddings_device_ith(
         struct llama_context * ctx,
         int32_t i,

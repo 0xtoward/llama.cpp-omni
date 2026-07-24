@@ -891,13 +891,10 @@ bool llama_context::get_embeddings_device_ith(int32_t i, llama_device_tensor * o
         if (!embeddings_device_only || !cparams.embeddings) {
             throw std::runtime_error("device-only embeddings are not enabled");
         }
-        if (n_outputs != 1 || output_resolve_row(i) != 0) {
-            throw std::runtime_error("device embedding handoff requires exactly one output row");
-        }
-
         auto * t_embd = gf_res_prev ? gf_res_prev->get_embd() : nullptr;
-        if (!t_embd || !t_embd->buffer || t_embd->ne[1] != 1) {
-            throw std::runtime_error("no live M=1 device embedding tensor");
+        if (!t_embd || !t_embd->buffer || !t_embd->data ||
+            t_embd->ne[0] <= 0 || t_embd->ne[1] <= 0) {
+            throw std::runtime_error("no live device embedding tensor");
         }
 
         auto * backend = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
@@ -905,11 +902,46 @@ bool llama_context::get_embeddings_device_ith(int32_t i, llama_device_tensor * o
             throw std::runtime_error("embedding tensor has no execution backend");
         }
 
-        out->tensor  = t_embd;
+        // The TTS prefill commonly produces multiple output rows, while its
+        // auxiliary head consumes only the final row. Expose a borrowed
+        // metadata view into that row without copying it to host. Negative -1
+        // always selects the final row of the most recent graph, including
+        // when the logical decode was split into ubatches.
+        int64_t row = -1;
+        if (i == -1) {
+            row = t_embd->ne[1] - 1;
+        } else {
+            row = output_resolve_row(i);
+            if (row >= t_embd->ne[1]) {
+                throw std::runtime_error(
+                        format("device embedding row %" PRId64
+                               " is not in the live graph output [0, %" PRId64 ")",
+                               row, t_embd->ne[1]));
+            }
+        }
+
+        embeddings_device_row_view = *t_embd;
+        embeddings_device_row_view.ne[1] = 1;
+        for (int d = 2; d < GGML_MAX_DIMS; ++d) {
+            embeddings_device_row_view.ne[d] = 1;
+        }
+        embeddings_device_row_view.view_src = t_embd;
+        embeddings_device_row_view.view_offs =
+                t_embd->view_offs + static_cast<size_t>(row) * t_embd->nb[1];
+        embeddings_device_row_view.data =
+                static_cast<char *>(t_embd->data) +
+                static_cast<size_t>(row) * t_embd->nb[1];
+        snprintf(
+                embeddings_device_row_view.name,
+                sizeof(embeddings_device_row_view.name),
+                "device_embd_row_%" PRId64,
+                row);
+
+        out->tensor  = &embeddings_device_row_view;
         out->backend = backend;
-        out->type    = static_cast<int32_t>(t_embd->type);
+        out->type    = static_cast<int32_t>(embeddings_device_row_view.type);
         for (int d = 0; d < 4; ++d) {
-            out->ne[d] = t_embd->ne[d];
+            out->ne[d] = embeddings_device_row_view.ne[d];
         }
         return true;
     } catch (const std::exception & err) {
