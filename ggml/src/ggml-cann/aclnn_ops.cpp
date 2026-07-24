@@ -3737,7 +3737,30 @@ void ggml_cann_step(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     acl_scalar_ptr alpha      = nullptr;
     alpha                     = ggml_cann_create_scalar(&alphaValue, aclDataType::ACL_FLOAT);
 
-    GGML_CANN_CALL_ACLNN_OP(ctx, GtScalar, acl_src.get(), alpha.get(), acl_dst.get());
+    // GtScalar produces BOOL. Passing an F32/F16 destination directly happens
+    // to satisfy the old wrapper's type system, but writes byte-sized boolean
+    // values into a floating-point tensor and corrupts every following
+    // element. Materialize the real BOOL result, then cast it to GGML STEP's
+    // floating-point output contract.
+    const size_t bool_bytes = static_cast<size_t>(ggml_nelements(dst));
+    ggml_cann_pool_alloc bool_alloc(ctx.pool(), bool_bytes);
+    size_t bool_nb[GGML_MAX_DIMS];
+    bool_nb[0] = sizeof(bool);
+    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+        bool_nb[i] = bool_nb[i - 1] * static_cast<size_t>(dst->ne[i - 1]);
+    }
+    acl_tensor_ptr acl_bool = ggml_cann_create_tensor(
+        bool_alloc.get(),
+        ACL_BOOL,
+        sizeof(bool),
+        dst->ne,
+        bool_nb,
+        GGML_MAX_DIMS);
+    GGML_CANN_CALL_ACLNN_OP(
+        ctx, GtScalar, acl_src.get(), alpha.get(), acl_bool.get());
+    GGML_CANN_CALL_ACLNN_OP(
+        ctx, Cast, acl_bool.get(), ggml_cann_type_mapping(dst->type),
+        acl_dst.get());
 }
 
 void ggml_cann_softplus(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
