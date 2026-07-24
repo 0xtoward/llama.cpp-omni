@@ -23,6 +23,26 @@
 } while (0)
 #endif
 
+static ggml_backend_t init_test_backend() {
+    const char * requested = std::getenv("OMNI_TEST_TTS_BACKEND");
+    if (requested && std::string(requested) == "cann") {
+        ggml_backend_t backend =
+                ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+        assert(backend != nullptr);
+        const std::string name = ggml_backend_name(backend);
+        assert(name.find("CANN") != std::string::npos ||
+               name.find("cann") != std::string::npos);
+        return backend;
+    }
+    return ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+}
+
+static bool test_backend_is_cann(ggml_backend_t backend) {
+    const std::string name = ggml_backend_name(backend);
+    return name.find("CANN") != std::string::npos ||
+           name.find("cann") != std::string::npos;
+}
+
 static void test_config() {
     omni::tts_device_head_config config;
     std::string error;
@@ -45,8 +65,7 @@ static void test_greedy_device_graph() {
     constexpr int hidden_size = 4;
     constexpr int vocab_size = 8;
 
-    ggml_backend_t backend =
-            ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    ggml_backend_t backend = init_test_backend();
     assert(backend != nullptr);
 
     ggml_context_ptr hidden_ctx(ggml_init({
@@ -97,7 +116,7 @@ static void test_greedy_device_graph() {
             /*repetition_window=*/4,
             /*greedy=*/true,
             /*apply_top_k_p=*/true,
-            /*require_cann=*/false,
+            /*require_cann=*/test_backend_is_cann(backend),
             /*trace=*/false,
             error));
 
@@ -220,8 +239,7 @@ static void test_fixed_uniform_32_codes(bool apply_top_k_p) {
     constexpr int top_k = 10;
     constexpr int min_keep = 3;
 
-    ggml_backend_t backend =
-            ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    ggml_backend_t backend = init_test_backend();
     assert(backend != nullptr);
     ggml_context_ptr hidden_ctx(ggml_init({
         /*.mem_size   =*/ ggml_tensor_overhead(),
@@ -273,7 +291,7 @@ static void test_fixed_uniform_32_codes(bool apply_top_k_p) {
             repetition_window,
             /*greedy=*/false,
             apply_top_k_p,
-            /*require_cann=*/false,
+            /*require_cann=*/test_backend_is_cann(backend),
             /*trace=*/false,
             error));
 
