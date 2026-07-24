@@ -102,7 +102,7 @@ static void test_greedy_device_graph() {
 
     omni::tts_device_head runner;
     std::string error;
-    assert(runner.initialize(
+    const bool initialized = runner.initialize(
             hidden,
             head.data(),
             emb.data(),
@@ -118,7 +118,12 @@ static void test_greedy_device_graph() {
             /*apply_top_k_p=*/true,
             /*require_cann=*/test_backend_is_cann(backend),
             /*trace=*/false,
-            error));
+            error);
+    if (!initialized) {
+        std::cerr << "TTS greedy device head initialization failed: "
+                  << error << "\n";
+    }
+    assert(initialized);
 
     omni::tts_device_head_step step;
     step.skip_repetition = true;
@@ -277,7 +282,7 @@ static void test_fixed_uniform_32_codes(bool apply_top_k_p) {
 
     omni::tts_device_head runner;
     std::string error;
-    assert(runner.initialize(
+    const bool initialized = runner.initialize(
             hidden,
             head.data(),
             emb.data(),
@@ -293,7 +298,12 @@ static void test_fixed_uniform_32_codes(bool apply_top_k_p) {
             apply_top_k_p,
             /*require_cann=*/test_backend_is_cann(backend),
             /*trace=*/false,
-            error));
+            error);
+    if (!initialized) {
+        std::cerr << "TTS stochastic device head initialization failed: "
+                  << error << " (top_k_p=" << apply_top_k_p << ")\n";
+    }
+    assert(initialized);
 
     std::vector<int32_t> recent;
     for (int step_idx = 0; step_idx < 32; ++step_idx) {
