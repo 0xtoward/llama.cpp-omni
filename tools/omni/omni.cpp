@@ -11068,6 +11068,19 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
     tts_output.resize(1/* batch_size */ * (ctx_omni->params->n_ctx /* seq_len */ * 2) * 256);
     bool llm_finish = false;
     bool llm_first_token_logged = false;
+
+    const char * cast_trace_mode = std::getenv("GGML_CANN_CAST_TRACE");
+    const bool cast_trace_phase =
+        cast_trace_mode != nullptr && cast_trace_mode[0] != '\0' &&
+        std::strcmp(cast_trace_mode, "off") != 0;
+    if (cast_trace_phase) {
+        std::fprintf(stderr,
+                     "CANN_CAST_TRACE_PHASE "
+                     "{\"phase\":\"thinker_decode\",\"event\":\"begin\","
+                     "\"n_past\":%d,\"max_tgt_len\":%d}\n",
+                     ctx_omni->n_past, max_tgt_len);
+        std::fflush(stderr);
+    }
     
     // 🔧 [修复双工缺字问题] 记录当前 chunk 是否是 turn 的结束
     // 此变量随 LLMOut 一起传递给 TTS 线程，避免全局状态的时序问题
@@ -11436,6 +11449,14 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
         }
         fflush(stdout);
         if (llm_finish) break;
+    }
+    if (cast_trace_phase) {
+        std::fprintf(stderr,
+                     "CANN_CAST_TRACE_PHASE "
+                     "{\"phase\":\"thinker_decode\",\"event\":\"end\","
+                     "\"n_past\":%d}\n",
+                     ctx_omni->n_past);
+        std::fflush(stderr);
     }
     fflush(stdout);
     // 🔧 [P1-SSE响应] 推送轮次结束标记
