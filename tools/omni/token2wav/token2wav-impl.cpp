@@ -2,6 +2,7 @@
 
 #include "token2wav-impl.h"
 #include "token2wav-backend-policy.h"
+#include "token2wav-hift-policy.h"
 #include "token2wav-profile.h"
 
 #include <atomic>
@@ -6727,6 +6728,91 @@ void voc_hg2_model::voc_hg2_model_free() {
     gguf_path.clear();
     num_threads = 1;
 }
+
+struct voc_hg2_runner::persistent_state {
+    using key = omni::flow::hift_plan_key;
+
+    struct plan {
+        key             cache_key{};
+        ggml_context *  ctx = nullptr;
+        ggml_gallocr_t  galloc = nullptr;
+        ggml_cgraph *   graph = nullptr;
+        ggml_tensor *   speech_upload_tcb = nullptr;
+        ggml_tensor *   speech_feat_c80_t_b = nullptr;
+        ggml_tensor *   cache_source_t1_b = nullptr;
+        ggml_tensor *   cache_source_flat = nullptr;
+        ggml_tensor *   wave_t_b = nullptr;
+        ggml_tensor *   source_t1_b = nullptr;
+        ggml_tensor *   source_tail_flat = nullptr;
+        int64_t         source_tail_len = 0;
+        uint64_t        last_use = 0;
+
+        ~plan() {
+            if (galloc) {
+                ggml_gallocr_free(galloc);
+            }
+            if (ctx) {
+                ggml_free(ctx);
+            }
+        }
+    };
+
+    omni::flow::hift_runner_config config{};
+    std::unordered_map<key, std::unique_ptr<plan>, omni::flow::hift_plan_key_hash> plans;
+    plan *   active_source_plan = nullptr;
+    int64_t  active_source_len = 0;
+    uint64_t clock = 0;
+    uint64_t session_epoch = 0;
+};
+
+voc_hg2_runner::voc_hg2_runner() = default;
+voc_hg2_runner::~voc_hg2_runner() = default;
+
+bool voc_hg2_runner::configure_from_environment() {
+    clear_persistent_state();
+    auto state = std::make_unique<persistent_state>();
+    state->config = omni::flow::hift_runner_config_from_environment();
+    if (!state->config) {
+        std::fprintf(stderr, "voc_hg2_runner: %s\n", state->config.error.c_str());
+        return false;
+    }
+    if (state->config.mode == omni::flow::hift_runner_mode::persistent_graph) {
+        if (!model || !model->backend || !omni_cann_stage_exact_enabled(model->backend, "hift")) {
+            std::fprintf(
+                stderr,
+                "voc_hg2_runner: OMNI_HIFT_RUNNER=persistent_graph requires "
+                "GGML_CANN_GRAPH_EXPERIMENT=stage_exact and GGML_CANN_GRAPH_STAGES containing hift\n");
+            return false;
+        }
+    }
+    std::fprintf(
+        stderr,
+        "voc_hg2_runner: mode=%s exact_shape_cache_capacity=%zu source_cache=%s\n",
+        omni::flow::hift_runner_mode_name(state->config.mode),
+        state->config.plan_cache_capacity,
+        state->config.mode == omni::flow::hift_runner_mode::ephemeral ? "host" : "device");
+    persistent_ = std::move(state);
+    return true;
+}
+
+void voc_hg2_runner::clear_persistent_state() {
+    persistent_.reset();
+}
+
+void voc_hg2_runner::reset_session() {
+    if (!persistent_) {
+        return;
+    }
+    persistent_->active_source_plan = nullptr;
+    persistent_->active_source_len = 0;
+    persistent_->session_epoch++;
+}
+
+bool voc_hg2_runner::uses_device_source_cache() const {
+    return persistent_ &&
+           persistent_->config.mode != omni::flow::hift_runner_mode::ephemeral;
+}
+
 bool voc_hg2_runner::voc_hg2_runner_build_graph(ggml_context * ctx,
                                                 ggml_cgraph *  gf,
                                                 ggml_tensor *  speech_feat_c80_t_b,
@@ -6759,7 +6845,7 @@ bool voc_hg2_runner::voc_hg2_runner_build_graph(ggml_context * ctx,
 bool voc_hg2_runner::voc_hg2_runner_eval(const std::vector<float> & speech_feat_bct,
                                          int64_t                    T_mel,
                                          std::vector<float> &       out_wave_bt,
-                                         int64_t &                  out_T_audio) const {
+                                         int64_t &                  out_T_audio) {
     std::vector<float> out_source_dummy;
     int64_t            out_T_source_dummy = 0;
     std::vector<float> empty_cache;
@@ -6773,7 +6859,8 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
                                                 std::vector<float> &       out_wave_bt,
                                                 int64_t &                  out_T_audio,
                                                 std::vector<float> &       out_source_bt1,
-                                                int64_t &                  out_T_source) const {
+                                                int64_t &                  out_T_source,
+                                                bool                       is_final) {
     if (!model || !model->hg2 || !model->backend || !model->galloc) {
         return false;
     }
@@ -6789,10 +6876,220 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
     if (Tc < 0) {
         return false;
     }
-    if (!(Tc == 0 && cache_source_bt1.empty()) && (int64_t) cache_source_bt1.size() != Tc * B) {
+    const bool persistent_device_cache = uses_device_source_cache();
+    if (!persistent_device_cache &&
+        !(Tc == 0 && cache_source_bt1.empty()) &&
+        (int64_t) cache_source_bt1.size() != Tc * B) {
         LOG_ERROR( "voc_hg2_runner_eval_stream: invalid cache_source_bt1 size\n");
         return false;
     }
+
+    if (persistent_device_cache) {
+        using state_t = persistent_state;
+        using plan_t = persistent_state::plan;
+        constexpr int64_t kPersistentSourceCacheLen =
+            8 * hifigan2::hg2_hift_generator::HG2_SAMPLES_PER_MEL;
+
+        state_t & state = *persistent_;
+        const omni::flow::hift_plan_phase stream_phase =
+            omni::flow::hift_plan_phase_for(is_final, Tc);
+        const state_t::key cache_key{stream_phase, T_mel, Tc};
+
+        auto found = state.plans.find(cache_key);
+        if (found == state.plans.end()) {
+            auto plan = std::make_unique<plan_t>();
+            plan->cache_key = cache_key;
+
+            ggml_init_params params{};
+            params.mem_size   = 2048ull * 1024ull * 1024ull;
+            params.mem_buffer = nullptr;
+            params.no_alloc   = true;
+            plan->ctx = ggml_init(params);
+            if (!plan->ctx) {
+                std::fprintf(stderr, "voc_hg2_runner: failed to create persistent HiFT context\n");
+                return false;
+            }
+
+            plan->speech_upload_tcb =
+                ggml_new_tensor_3d(plan->ctx, GGML_TYPE_F32, T_mel, C, B);
+            plan->speech_feat_c80_t_b =
+                ggml_cont(plan->ctx, ggml_permute(plan->ctx, plan->speech_upload_tcb, 1, 0, 2, 3));
+            plan->cache_source_t1_b =
+                ggml_new_tensor_3d(plan->ctx, GGML_TYPE_F32, Tc, 1, B);
+            plan->graph =
+                ggml_new_graph_custom(plan->ctx, GGML_DEFAULT_GRAPH_SIZE * 256, false);
+
+            {
+                omni::flow::profile::ScopeTimer timer("voc.build_alloc");
+                if (!voc_hg2_runner_build_graph(
+                        plan->ctx,
+                        plan->graph,
+                        plan->speech_feat_c80_t_b,
+                        plan->cache_source_t1_b,
+                        &plan->wave_t_b,
+                        &plan->source_t1_b)) {
+                    std::fprintf(stderr, "voc_hg2_runner: failed to build persistent HiFT graph\n");
+                    return false;
+                }
+                plan->galloc =
+                    ggml_gallocr_new(ggml_backend_get_default_buffer_type(model->backend));
+                if (!plan->galloc || !ggml_gallocr_alloc_graph(plan->galloc, plan->graph)) {
+                    std::fprintf(stderr, "voc_hg2_runner: failed to allocate persistent HiFT graph\n");
+                    return false;
+                }
+            }
+
+            if (Tc > 0) {
+                plan->cache_source_flat =
+                    ggml_view_1d(plan->ctx, plan->cache_source_t1_b, Tc, 0);
+                plan->cache_source_flat->buffer = plan->cache_source_t1_b->buffer;
+            }
+            plan->source_tail_len =
+                std::min<int64_t>(kPersistentSourceCacheLen, plan->source_t1_b->ne[0]);
+            plan->source_tail_flat = ggml_view_1d(
+                plan->ctx,
+                plan->source_t1_b,
+                plan->source_tail_len,
+                static_cast<size_t>(plan->source_t1_b->ne[0] - plan->source_tail_len) *
+                    plan->source_t1_b->nb[0]);
+            plan->source_tail_flat->buffer = plan->source_t1_b->buffer;
+
+            {
+                omni::flow::profile::ScopeTimer timer("voc.upload.constants");
+                if (!model->hg2->gen.dsp.hg_stft16_params_upload_consts(model->backend) ||
+                    !model->hg2->gen.source_nsf.sine_gen.hg_sine_gen2_upload_consts(model->backend)) {
+                    std::fprintf(stderr, "voc_hg2_runner: failed to upload persistent HiFT constants\n");
+                    return false;
+                }
+            }
+
+            plan->last_use = ++state.clock;
+            plan_t * inserted = plan.get();
+            state.plans.emplace(cache_key, std::move(plan));
+            found = state.plans.find(cache_key);
+            std::fprintf(
+                stderr,
+                "voc_hg2_runner: built exact HiFT plan phase=%s T_mel=%lld Tc=%lld plans=%zu\n",
+                stream_phase == omni::flow::hift_plan_phase::first ? "first" :
+                stream_phase == omni::flow::hift_plan_phase::final ? "final" : "steady",
+                (long long) T_mel,
+                (long long) Tc,
+                state.plans.size());
+            GGML_ASSERT(found != state.plans.end() && found->second.get() == inserted);
+        }
+
+        plan_t & plan = *found->second;
+        plan.last_use = ++state.clock;
+
+        {
+            omni::flow::profile::ScopeTimer timer("voc.upload.speech");
+            hg_backend_tensor_set(
+                model->backend,
+                plan.speech_upload_tcb,
+                speech_feat_bct.data(),
+                speech_feat_bct.size() * sizeof(float));
+        }
+
+        if (Tc > 0) {
+            omni::flow::profile::ScopeTimer timer("voc.source_cache.d2d");
+            if (state.active_source_plan &&
+                state.active_source_len == Tc &&
+                state.active_source_plan->source_tail_flat &&
+                plan.cache_source_flat) {
+                ggml_backend_tensor_copy(
+                    state.active_source_plan->source_tail_flat,
+                    plan.cache_source_flat);
+            } else if ((int64_t) cache_source_bt1.size() == Tc * B) {
+                // Compatibility bridge for entering persistent mode with an
+                // already-populated host cache. Normal persistent hot paths
+                // never take this branch.
+                hg_backend_tensor_set(
+                    model->backend,
+                    plan.cache_source_t1_b,
+                    cache_source_bt1.data(),
+                    cache_source_bt1.size() * sizeof(float));
+            } else {
+                std::fprintf(
+                    stderr,
+                    "voc_hg2_runner: persistent source cache unavailable "
+                    "(expected Tc=%lld, active=%lld); refusing host fallback\n",
+                    (long long) Tc,
+                    (long long) state.active_source_len);
+                return false;
+            }
+        }
+
+        if (omni::flow::profile::print_graph_enabled()) {
+            static std::atomic<bool> printed{false};
+            bool expected = false;
+            if (printed.compare_exchange_strong(expected, true)) {
+                std::fprintf(stderr, "[profile] ===== persistent vocoder (HiFiGAN2) graph =====\n");
+                std::fprintf(stderr, "[profile] n_nodes=%d\n", ggml_graph_n_nodes(plan.graph));
+                ggml_graph_print(plan.graph);
+            }
+        }
+
+        {
+            omni::flow::profile::ScopeTimer timer("voc.compute");
+            const bool allow_capture =
+                state.config.mode == omni::flow::hift_runner_mode::persistent_graph;
+            omni_set_cann_stage_exact_context(
+                model->backend,
+                "hift",
+                /*epoch=*/0,
+                allow_capture,
+                T_mel,
+                Tc,
+                reinterpret_cast<uintptr_t>(plan.speech_upload_tcb->data));
+            const ggml_status status =
+                ggml_backend_graph_compute(model->backend, plan.graph);
+            if (status != GGML_STATUS_SUCCESS) {
+                std::fprintf(stderr, "voc_hg2_runner: persistent HiFT graph compute failed\n");
+                return false;
+            }
+        }
+
+        {
+            omni::flow::profile::ScopeTimer timer("voc.download.wave");
+            std::vector<float> wave_tb;
+            if (!hg_read_tensor_2d_tb_f32(model->backend, plan.wave_t_b, wave_tb)) {
+                return false;
+            }
+            out_T_audio = plan.wave_t_b->ne[0];
+            hg_tb_to_bt(wave_tb, out_T_audio, B, out_wave_bt);
+        }
+
+        // The source tail remains in device memory and is copied directly into
+        // the next exact-shape plan. Only the waveform crosses to the host.
+        out_source_bt1.clear();
+        out_T_source = plan.source_t1_b->ne[0];
+        state.active_source_plan = &plan;
+        state.active_source_len = plan.source_tail_len;
+
+        while (state.plans.size() > state.config.plan_cache_capacity) {
+            auto victim = state.plans.end();
+            for (auto it = state.plans.begin(); it != state.plans.end(); ++it) {
+                if (it->second.get() == state.active_source_plan) {
+                    continue;
+                }
+                if (victim == state.plans.end() ||
+                    it->second->last_use < victim->second->last_use) {
+                    victim = it;
+                }
+            }
+            if (victim == state.plans.end()) {
+                break;
+            }
+            std::fprintf(
+                stderr,
+                "voc_hg2_runner: evict exact HiFT plan T_mel=%lld Tc=%lld\n",
+                (long long) victim->first.t_mel,
+                (long long) victim->first.tc);
+            state.plans.erase(victim);
+        }
+        return true;
+    }
+
     ggml_init_params params{};
     params.mem_size    = 2048ull * 1024ull * 1024ull;
     params.mem_buffer  = nullptr;
@@ -9858,6 +10155,9 @@ bool Token2Wav::load_models(const std::string & encoder_gguf,
         models_loaded_ = false;
         return false;
     }
+    // Persistent plans own graph allocations backed by the current vocoder
+    // backend. Release them before replacing that backend on reload.
+    voc_runner_.clear_persistent_state();
     if (!voc_model_.voc_hg2_model_init_from_gguf(vocoder_gguf, device_vocoder, kDefaultThreads)) {
         LOG_ERROR( "Token2Wav.load_models: voc_hg2_model_init_from_gguf failed\n");
         models_loaded_ = false;
@@ -9879,6 +10179,11 @@ bool Token2Wav::load_models(const std::string & encoder_gguf,
     }
 
     voc_runner_.model = &voc_model_;
+    if (!voc_runner_.configure_from_environment()) {
+        voc_model_.voc_hg2_model_free();
+        models_loaded_ = false;
+        return false;
+    }
     models_loaded_    = true;
     return true;
 }
@@ -9890,6 +10195,7 @@ bool Token2Wav::start_stream_with_prompt_cache_gguf(const std::string & prompt_c
     voc_cache_source_bt1_.clear();
     voc_Tc_ = 0;
     voc_speech_cache_bt_.clear();
+    voc_runner_.reset_session();
     token2wav_utils::ensure_hamming_window_2n((int64_t) kSourceCacheLen, voc_speech_window_);
 
     if (!models_loaded_) {
@@ -9910,6 +10216,7 @@ bool Token2Wav::start_stream_with_prompt(const Token2Mel::PromptBundle & prompt,
     voc_cache_source_bt1_.clear();
     voc_Tc_ = 0;
     voc_speech_cache_bt_.clear();
+    voc_runner_.reset_session();
     token2wav_utils::ensure_hamming_window_2n((int64_t) kSourceCacheLen, voc_speech_window_);
 
     if (!models_loaded_) {
@@ -9985,7 +10292,7 @@ bool Token2Wav::push_tokens_window(const int32_t *      tokens,
     int64_t            out_T_source = 0;
     const auto t_voc0 = clock::now();
     if (!voc_runner_.voc_hg2_runner_eval_stream(mel_in_bct, T_mel, voc_cache_source_bt1_, voc_Tc_, wave_bt_out,
-                                                out_T_audio, out_source_bt1, out_T_source)) {
+                                                out_T_audio, out_source_bt1, out_T_source, is_final)) {
         LOG_ERROR( "Token2Wav.push_tokens_window: voc_hg2_runner_eval_stream failed\n");
         return false;
     }
@@ -10003,7 +10310,10 @@ bool Token2Wav::push_tokens_window(const int32_t *      tokens,
         voc_mel_cache_bct_.swap(next_mel_cache);
     }
 
-    {
+    if (voc_runner_.uses_device_source_cache()) {
+        voc_cache_source_bt1_.clear();
+        voc_Tc_ = std::min<int64_t>(out_T_source, (int64_t) kSourceCacheLen);
+    } else {
         std::vector<float> next_source_cache;
         token2wav_utils::crop_t_tail_b1(out_source_bt1, (int64_t) kSourceCacheLen, next_source_cache);
         voc_cache_source_bt1_.swap(next_source_cache);
@@ -10047,6 +10357,7 @@ void Token2Wav::reset_stream() {
     voc_Tc_ = 0;
     voc_speech_cache_bt_.clear();
     voc_speech_window_.clear();
+    voc_runner_.reset_session();
 }
 
 }  // namespace flow

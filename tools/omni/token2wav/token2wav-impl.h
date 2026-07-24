@@ -2007,7 +2007,16 @@ struct voc_hg2_model {
     void voc_hg2_model_free();
 };
 struct voc_hg2_runner {
+    voc_hg2_runner();
+    ~voc_hg2_runner();
+    voc_hg2_runner(const voc_hg2_runner &) = delete;
+    voc_hg2_runner & operator=(const voc_hg2_runner &) = delete;
+
     voc_hg2_model * model = nullptr;
+    bool configure_from_environment();
+    void clear_persistent_state();
+    void reset_session();
+    bool uses_device_source_cache() const;
     bool voc_hg2_runner_build_graph(ggml_context * ctx,
                                     ggml_cgraph *  gf,
                                     ggml_tensor *  speech_feat_c80_t_b,
@@ -2017,7 +2026,7 @@ struct voc_hg2_runner {
     bool voc_hg2_runner_eval(const std::vector<float> & speech_feat_bct,
                              int64_t                    T_mel,
                              std::vector<float> &       out_wave_bt,
-                             int64_t &                  out_T_audio) const;
+                             int64_t &                  out_T_audio);
     bool voc_hg2_runner_eval_stream(const std::vector<float> & speech_feat_bct,
                                     int64_t                    T_mel,
                                     const std::vector<float> & cache_source_bt1,
@@ -2025,7 +2034,12 @@ struct voc_hg2_runner {
                                     std::vector<float> &       out_wave_bt,
                                     int64_t &                  out_T_audio,
                                     std::vector<float> &       out_source_bt1,
-                                    int64_t &                  out_T_source) const;
+                                    int64_t &                  out_T_source,
+                                    bool                       is_final = false);
+
+  private:
+    struct persistent_state;
+    std::unique_ptr<persistent_state> persistent_;
 };
 }  // namespace vocoder
 }  // namespace omni

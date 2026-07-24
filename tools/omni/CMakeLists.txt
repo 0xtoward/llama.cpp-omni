@@ -217,6 +217,15 @@ if (LLAMA_BUILD_TESTS)
     )
     set_tests_properties(token2wav-backend-policy PROPERTIES LABELS "main;omni")
 
+    add_executable(test-hift-runner-policy test/test-hift-runner-policy.cpp)
+    target_include_directories(test-hift-runner-policy PRIVATE .)
+    target_compile_features(test-hift-runner-policy PRIVATE cxx_std_17)
+    add_test(
+        NAME hift-runner-policy
+        COMMAND test-hift-runner-policy
+    )
+    set_tests_properties(hift-runner-policy PROPERTIES LABELS "main;omni")
+
     add_executable(test-omni-sampling-policy test/test-sampling-policy.cpp)
     target_include_directories(test-omni-sampling-policy PRIVATE .)
     target_compile_features(test-omni-sampling-policy PRIVATE cxx_std_17)

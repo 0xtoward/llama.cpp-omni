@@ -17,6 +17,7 @@ enum class ggml_cann_graph_experiment {
 enum class ggml_cann_graph_stage : uint32_t {
     tts_ar    = 1u << 0,
     token2mel = 1u << 1,
+    hift      = 1u << 2,
 };
 
 enum class ggml_cann_stage_exact_action {
@@ -92,6 +93,12 @@ inline std::string ggml_cann_graph_stages_name(const ggml_cann_experiment_config
             result += ",";
         }
         result += "token2mel";
+    }
+    if (ggml_cann_graph_stage_enabled(config, ggml_cann_graph_stage::hift)) {
+        if (!result.empty()) {
+            result += ",";
+        }
+        result += "hift";
     }
     return result;
 }
@@ -178,7 +185,7 @@ inline ggml_cann_experiment_parse_result ggml_cann_parse_experiment_config(
         }
     } else {
         if (stages_value.empty()) {
-            result.error = "GGML_CANN_GRAPH_STAGES must list tts_ar and/or token2mel for stage_exact";
+            result.error = "GGML_CANN_GRAPH_STAGES must list tts_ar, token2mel, and/or hift for stage_exact";
             return result;
         }
         if (std::any_of(stages_value.begin(), stages_value.end(), [](unsigned char ch) {
@@ -197,8 +204,10 @@ inline ggml_cann_experiment_parse_result ggml_cann_parse_experiment_config(
                 bit = static_cast<uint32_t>(ggml_cann_graph_stage::tts_ar);
             } else if (item == "token2mel") {
                 bit = static_cast<uint32_t>(ggml_cann_graph_stage::token2mel);
+            } else if (item == "hift") {
+                bit = static_cast<uint32_t>(ggml_cann_graph_stage::hift);
             } else {
-                result.error = "GGML_CANN_GRAPH_STAGES accepts only tts_ar,token2mel";
+                result.error = "GGML_CANN_GRAPH_STAGES accepts only tts_ar,token2mel,hift";
                 return result;
             }
             if ((result.config.graph_stages & bit) != 0) {

@@ -2619,12 +2619,15 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
     const bool token2mel_domain =
         graph_domain == "token2mel.nonlast" || graph_domain == "token2mel.last";
     const bool tts_ar_domain = graph_domain == "tts_ar";
+    const bool hift_domain = graph_domain == "hift";
     const bool stage_exact_domain_enabled =
         stage_exact_mode &&
         ((token2mel_domain &&
           ggml_cann_graph_stage_enabled(cann_ctx->experiment_config, ggml_cann_graph_stage::token2mel)) ||
          (tts_ar_domain &&
-          ggml_cann_graph_stage_enabled(cann_ctx->experiment_config, ggml_cann_graph_stage::tts_ar)));
+          ggml_cann_graph_stage_enabled(cann_ctx->experiment_config, ggml_cann_graph_stage::tts_ar)) ||
+         (hift_domain &&
+          ggml_cann_graph_stage_enabled(cann_ctx->experiment_config, ggml_cann_graph_stage::hift)));
 #ifdef USE_ACL_GRAPH
     ggml_cann_graph_lookup graph_lookup;
     graph_lookup.fingerprint =
@@ -3357,6 +3360,9 @@ static bool ggml_backend_cann_stage_exact_enabled(ggml_backend_t backend, const 
     }
     if (std::strcmp(stage, "tts_ar") == 0) {
         return ggml_cann_graph_stage_enabled(ctx->experiment_config, ggml_cann_graph_stage::tts_ar);
+    }
+    if (std::strcmp(stage, "hift") == 0) {
+        return ggml_cann_graph_stage_enabled(ctx->experiment_config, ggml_cann_graph_stage::hift);
     }
     return false;
 }

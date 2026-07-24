@@ -34,16 +34,17 @@ int main() {
     }
     {
         const auto parsed = ggml_cann_parse_experiment_config(
-            "stage_exact", "token2mel,tts_ar", "none", "ggml", "1", false, false);
+            "stage_exact", "token2mel,tts_ar,hift", "none", "ggml", "1", false, false);
         assert(parsed);
         assert(parsed.config.graph == ggml_cann_graph_experiment::stage_exact);
         assert(ggml_cann_graph_stage_enabled(parsed.config, ggml_cann_graph_stage::token2mel));
         assert(ggml_cann_graph_stage_enabled(parsed.config, ggml_cann_graph_stage::tts_ar));
-        assert(ggml_cann_graph_stages_name(parsed.config) == "tts_ar,token2mel");
+        assert(ggml_cann_graph_stage_enabled(parsed.config, ggml_cann_graph_stage::hift));
+        assert(ggml_cann_graph_stages_name(parsed.config) == "tts_ar,token2mel,hift");
     }
     for (const char * invalid : {
              "", "token2mel,", ",token2mel", "token2mel,token2mel",
-             "token2mel, tts_ar", "hift" }) {
+             "token2mel, tts_ar", "unknown" }) {
         const auto parsed = ggml_cann_parse_experiment_config(
             "stage_exact", invalid, "none", "ggml", "0", false, false);
         assert(!parsed);
