@@ -656,6 +656,7 @@ struct ggml_backend_cann_context {
     ggml_cann_experiment_config experiment_config;
     uint64_t                experiment_step = 0;
     uint64_t                experiment_add_rms_hits = 0;
+    uint64_t                experiment_add_rms_candidates = 0;
     bool                   async_mode;
     // Rope Cache
     ggml_cann_rope_cache   rope_cache;

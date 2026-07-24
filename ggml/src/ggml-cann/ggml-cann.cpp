@@ -2317,6 +2317,11 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
         for (int i = 0; i < cgraph->n_nodes; i++) {
             ggml_tensor * node = cgraph->nodes[i];
             if (opt_fusion) {
+                if (i + 1 < cgraph->n_nodes &&
+                    node->op == GGML_OP_ADD &&
+                    cgraph->nodes[i + 1]->op == GGML_OP_RMS_NORM) {
+                    cann_ctx->experiment_add_rms_candidates++;
+                }
                 if (ggml_cann_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM })) {
                     ggml_cann_op_add_rms_norm_fused(*cann_ctx, node, cgraph->nodes[i + 1]);
                     cann_ctx->experiment_add_rms_hits++;
@@ -2377,6 +2382,7 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
     // calculate rope cache for fist layer in current device.
     cann_ctx->rope_cache.cached = false;
     cann_ctx->experiment_add_rms_hits = 0;
+    cann_ctx->experiment_add_rms_candidates = 0;
 
     bool graph_capture_required = false;
     const int64_t n_tokens = ggml_cann_graph_token_count(cgraph);
@@ -2455,6 +2461,7 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
             "\"kv_bucket\":null,\"graph_fingerprint\":\"%016llx\","
             "\"graph_event\":\"%s\",\"miss_reason\":\"%s\","
             "\"fusion_hits\":{\"add_rms\":%llu},"
+            "\"fusion_candidates\":{\"add_rms\":%llu},"
             "\"cache\":{\"hits\":%llu,\"misses\":%llu,\"captures\":%llu,\"evictions\":%llu}}\n",
             static_cast<unsigned long long>(cann_ctx->experiment_step++),
             n_tokens == 1 ? "decode" : "prefill_or_other",
@@ -2463,6 +2470,7 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
             graph_event,
             miss_reason,
             static_cast<unsigned long long>(cann_ctx->experiment_add_rms_hits),
+            static_cast<unsigned long long>(cann_ctx->experiment_add_rms_candidates),
             static_cast<unsigned long long>(hits),
             static_cast<unsigned long long>(misses),
             static_cast<unsigned long long>(captures),
