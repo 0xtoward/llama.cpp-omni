@@ -26,6 +26,7 @@ struct audition_audio_f32;
 
 // Forward declaration for C++ Token2Wav
 namespace omni {
+class tts_device_head;
 namespace flow {
 class Token2WavSession;
 }
@@ -185,6 +186,11 @@ struct omni_context {
     struct llama_context * ctx_tts_llama = NULL;
     struct llama_model * model_tts = NULL;
     struct common_sampler * ctx_tts_sampler = NULL;
+    // Experimental accelerator-side TTS code head.  This remains disabled by
+    // default; OMNI_TTS_HEAD=cann enables the fail-closed device path.
+    std::shared_ptr<omni::tts_device_head> tts_device_head_runner;
+    bool tts_device_head_enabled = false;
+    bool tts_device_head_trace = false;
     
     // struct TTSContext * ctx_tts = NULL;
     struct vocal_ctx * vocal = NULL;

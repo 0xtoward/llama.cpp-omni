@@ -5,6 +5,7 @@
 #include "llama-memory.h"
 
 #include <cassert>
+#include <cinttypes>
 #include <cstring>
 #include <algorithm>
 #include <sstream>
@@ -40,6 +41,26 @@ bool llama_batch_allocr::init(
     //
     // validate input batch
     //
+
+    if (batch.embd_device) {
+        auto * device_embd = static_cast<ggml_tensor *>(batch.embd_device);
+        if (batch.token || batch.embd) {
+            LLAMA_LOG_ERROR("%s: embd_device is mutually exclusive with token/embd\n", __func__);
+            return false;
+        }
+        if (batch.n_tokens != 1) {
+            LLAMA_LOG_ERROR("%s: embd_device currently supports only M=1, got %d tokens\n",
+                    __func__, batch.n_tokens);
+            return false;
+        }
+        if (!device_embd->buffer || device_embd->type != GGML_TYPE_F32 ||
+            device_embd->ne[0] != (int64_t) n_embd || device_embd->ne[1] != 1) {
+            LLAMA_LOG_ERROR("%s: invalid embd_device tensor (type=%s, shape=[%" PRId64 ",%" PRId64 "], n_embd=%u)\n",
+                    __func__, ggml_type_name(device_embd->type),
+                    device_embd->ne[0], device_embd->ne[1], n_embd);
+            return false;
+        }
+    }
 
     if (n_seq_max > LLAMA_MAX_SEQ) {
         LLAMA_LOG_ERROR("%s: n_seq_max = %d > %d\n", __func__, n_seq_max, LLAMA_MAX_SEQ);
@@ -218,6 +239,7 @@ bool llama_batch_allocr::init(
             /*.n_pos        =*/ n_pos_per_embd,
             /*.token        =*/ batch.token,
             /*.embd         =*/ batch.embd,
+            /*.embd_device  =*/ static_cast<ggml_tensor *>(batch.embd_device),
             /*.pos          =*/ batch.pos,
             /*.n_seq_id     =*/ batch.n_seq_id,
             /*.seq_id       =*/ batch.seq_id,
@@ -422,6 +444,7 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t 
 
         /*.token        =*/ udata->token.data(),
         /*.embd         =*/ nullptr,
+        /*.embd_device  =*/ nullptr,
         /*.pos          =*/ udata->pos.data(),
         /*.n_seq_id     =*/ udata->n_seq_id.data(),
         /*.seq_id       =*/ udata->seq_id.data(),
@@ -685,6 +708,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
 
     auto udata = std::make_shared<llama_ubatch::data_t>();
 
+    const bool has_embd = batch.embd || batch.embd_device;
     const int64_t n_embd_all = batch.embd ? (int64_t) n_tokens*n_embd : 0;
     const int64_t n_pos_all  =              (int64_t) n_tokens*n_pos_per_embd;
 
@@ -757,6 +781,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
 
         /*.token        =*/ batch.token ? udata->token.data() : nullptr,
         /*.embd         =*/ batch.embd ? udata->embd.data() : nullptr,
+        /*.embd_device  =*/ has_embd ? static_cast<ggml_tensor *>(batch.embd_device) : nullptr,
         /*.pos          =*/ udata->pos.data(),
         /*.n_seq_id     =*/ udata->n_seq_id.data(),
         /*.seq_id       =*/ udata->seq_id.data(),
@@ -806,6 +831,7 @@ void llama_batch_allocr::ubatch_print(const llama_ubatch & ubatch, int debug) {
 
         LLAMA_LOG_DEBUG("%s:   token      = %p\n", __func__, (void *) ubatch.token);
         LLAMA_LOG_DEBUG("%s:   embd       = %p\n", __func__, (void *) ubatch.embd);
+        LLAMA_LOG_DEBUG("%s:   embd_device= %p\n", __func__, (void *) ubatch.embd_device);
         LLAMA_LOG_DEBUG("%s:   pos        = %p\n", __func__, (void *) ubatch.pos);
         LLAMA_LOG_DEBUG("%s:   n_seq_id   = %p\n", __func__, (void *) ubatch.n_seq_id);
         LLAMA_LOG_DEBUG("%s:   seq_id     = %p\n", __func__, (void *) ubatch.seq_id);
@@ -871,6 +897,7 @@ struct llama_batch llama_batch_get_one(
         /*n_seq_id =*/ nullptr,
         /*seq_id   =*/ nullptr,
         /*logits   =*/ nullptr,
+        /*embd_device =*/ nullptr,
     };
 }
 
@@ -883,6 +910,7 @@ struct llama_batch llama_batch_init(int32_t n_tokens_alloc, int32_t embd, int32_
         /*n_seq_id =*/ nullptr,
         /*seq_id   =*/ nullptr,
         /*logits   =*/ nullptr,
+        /*embd_device =*/ nullptr,
     };
 
     if (embd) {

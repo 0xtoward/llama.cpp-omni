@@ -843,6 +843,10 @@ float * llama_context::get_logits_ith(int32_t i) {
 }
 
 float * llama_context::get_embeddings() {
+    if (embeddings_device_only) {
+        LLAMA_LOG_ERROR("%s: host embeddings disabled by device-only mode\n", __func__);
+        return nullptr;
+    }
     output_reorder();
 
     return embd.data;
@@ -853,6 +857,10 @@ llama_token * llama_context::get_sampled_tokens()  const{
 }
 
 float * llama_context::get_embeddings_ith(int32_t i) {
+    if (embeddings_device_only) {
+        LLAMA_LOG_ERROR("%s: host embeddings disabled by device-only mode\n", __func__);
+        return nullptr;
+    }
     output_reorder();
 
     try {
@@ -870,6 +878,43 @@ float * llama_context::get_embeddings_ith(int32_t i) {
 #else
         return nullptr;
 #endif
+    }
+}
+
+bool llama_context::get_embeddings_device_ith(int32_t i, llama_device_tensor * out) {
+    if (!out) {
+        return false;
+    }
+    *out = {};
+
+    try {
+        if (!embeddings_device_only || !cparams.embeddings) {
+            throw std::runtime_error("device-only embeddings are not enabled");
+        }
+        if (n_outputs != 1 || output_resolve_row(i) != 0) {
+            throw std::runtime_error("device embedding handoff requires exactly one output row");
+        }
+
+        auto * t_embd = gf_res_prev ? gf_res_prev->get_embd() : nullptr;
+        if (!t_embd || !t_embd->buffer || t_embd->ne[1] != 1) {
+            throw std::runtime_error("no live M=1 device embedding tensor");
+        }
+
+        auto * backend = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
+        if (!backend) {
+            throw std::runtime_error("embedding tensor has no execution backend");
+        }
+
+        out->tensor  = t_embd;
+        out->backend = backend;
+        out->type    = static_cast<int32_t>(t_embd->type);
+        for (int d = 0; d < 4; ++d) {
+            out->ne[d] = t_embd->ne[d];
+        }
+        return true;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: invalid device embedding id %d, reason: %s\n", __func__, i, err.what());
+        return false;
     }
 }
 
@@ -1098,6 +1143,14 @@ void llama_context::set_embeddings(bool value) {
     //sched_need_reserve = true;
 }
 
+void llama_context::set_embeddings_device_only(bool value) {
+    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+    embeddings_device_only = value;
+    if (value) {
+        cparams.embeddings = true;
+    }
+}
+
 void llama_context::set_embeddings_pre_norm(bool value, bool masked) {
     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
 
@@ -1321,7 +1374,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 int llama_context::encode(const llama_batch & batch_inp) {
     // MTP hook batches carry both token (next-token id) and embd (h_pre_norm row),
     // so accept either present rather than requiring exactly one.
-    GGML_ASSERT(batch_inp.token || batch_inp.embd);
+    GGML_ASSERT(batch_inp.token || batch_inp.embd || batch_inp.embd_device);
 
     if (batch_inp.n_tokens == 0) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
@@ -1406,7 +1459,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
     }
 
     // extract embeddings
-    if (embd.data && t_embd) {
+    if (!embeddings_device_only && embd.data && t_embd) {
         ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
         GGML_ASSERT(backend_embd != nullptr);
 
@@ -1624,7 +1677,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 int llama_context::decode(const llama_batch & batch_inp) {
     // MTP hook batches carry both token (next-token id) and embd (h_pre_norm row),
     // so accept either present rather than requiring exactly one.
-    GGML_ASSERT(batch_inp.token || batch_inp.embd);
+    GGML_ASSERT(batch_inp.token || batch_inp.embd || batch_inp.embd_device);
 
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
@@ -1846,7 +1899,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         // extract embeddings
-        if (embd.data && t_embd && n_outputs > 0) {
+        if (!embeddings_device_only && embd.data && t_embd && n_outputs > 0) {
             ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
             GGML_ASSERT(backend_embd != nullptr);
 
@@ -3547,6 +3600,10 @@ void llama_set_embeddings(llama_context * ctx, bool embeddings) {
     ctx->set_embeddings(embeddings);
 }
 
+void llama_set_embeddings_device_only(llama_context * ctx, bool value) {
+    ctx->set_embeddings_device_only(value);
+}
+
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
     ctx->set_causal_attn(causal_attn);
 }
@@ -3589,6 +3646,13 @@ float * llama_get_embeddings_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
     return ctx->get_embeddings_ith(i);
+}
+
+bool llama_get_embeddings_device_ith(
+        llama_context * ctx,
+        int32_t i,
+        llama_device_tensor * out) {
+    return ctx->get_embeddings_device_ith(i, out);
 }
 
 float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {

@@ -14,6 +14,8 @@ add_library(omni
             omni.h
             tts-condition-graph.cpp
             tts-condition-graph.h
+            tts-device-head.cpp
+            tts-device-head.h
             audition.cpp
             audition.h
             vision.cpp
@@ -225,6 +227,16 @@ if (LLAMA_BUILD_TESTS)
         COMMAND test-hift-runner-policy
     )
     set_tests_properties(hift-runner-policy PROPERTIES LABELS "main;omni")
+
+    add_executable(test-tts-device-head test/test-tts-device-head.cpp)
+    target_link_libraries(test-tts-device-head PRIVATE omni)
+    target_include_directories(test-tts-device-head PRIVATE . ../..)
+    target_compile_features(test-tts-device-head PRIVATE cxx_std_17)
+    add_test(
+        NAME tts-device-head
+        COMMAND test-tts-device-head
+    )
+    set_tests_properties(tts-device-head PROPERTIES LABELS "main;omni")
 
     add_executable(test-omni-sampling-policy test/test-sampling-policy.cpp)
     target_include_directories(test-omni-sampling-policy PRIVATE .)

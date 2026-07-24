@@ -88,7 +88,13 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
     }
 
-    if (ubatch->embd) {
+    if (ubatch->embd_device) {
+        GGML_ASSERT(n_embd == embd->ne[0]);
+        GGML_ASSERT(ubatch->embd_device->type == embd->type);
+        GGML_ASSERT(ubatch->embd_device->ne[0] == embd->ne[0]);
+        GGML_ASSERT(ubatch->embd_device->ne[1] == embd->ne[1]);
+        ggml_backend_tensor_copy(ubatch->embd_device, embd);
+    } else if (ubatch->embd) {
         GGML_ASSERT(n_embd == embd->ne[0]);
 
         const int64_t n_tokens = ubatch->n_tokens;
@@ -101,7 +107,8 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
     res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
-    res &= (!params.ubatch.embd)  || (embd   &&   embd->ne[1] == params.ubatch.n_tokens);
+    res &= (!params.ubatch.embd && !params.ubatch.embd_device) ||
+           (embd && embd->ne[1] == params.ubatch.n_tokens);
 
     return res;
 }
@@ -113,16 +120,29 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
     } else {
         // note: mtmd embedding input goes through here
-        GGML_ASSERT(ubatch->embd);
+        GGML_ASSERT(ubatch->embd || ubatch->embd_device);
         GGML_ASSERT(n_embd == embd->ne[0]);
 
-        ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
+        if (ubatch->embd_device) {
+            GGML_ASSERT(ubatch->embd_device->type == embd->type);
+            GGML_ASSERT(ubatch->embd_device->ne[0] == embd->ne[0]);
+            GGML_ASSERT(ubatch->embd_device->ne[1] == embd->ne[1]);
+            ggml_backend_tensor_copy(ubatch->embd_device, embd);
+        } else {
+            ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
+        }
     }
 
     // TODO: extend llama_ubatch to differentiate between token embeddings and hidden states
     //       for now, we assume that the hidden state is always provided as an embedding
     //       ref: https://github.com/ggml-org/llama.cpp/pull/23643
-    if (ubatch->embd) {
+    if (ubatch->embd_device) {
+        GGML_ASSERT(n_embd == h->ne[0]);
+        GGML_ASSERT(ubatch->embd_device->type == h->type);
+        GGML_ASSERT(ubatch->embd_device->ne[0] == h->ne[0]);
+        GGML_ASSERT(ubatch->embd_device->ne[1] == h->ne[1]);
+        ggml_backend_tensor_copy(ubatch->embd_device, h);
+    } else if (ubatch->embd) {
         GGML_ASSERT(n_embd == h->ne[0]);
 
         ggml_backend_tensor_set(h, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
@@ -133,8 +153,10 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
     res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
-    res &= (!params.ubatch.embd)  || (embd   && embd->ne[1]   == params.ubatch.n_tokens);
-    res &= (!params.ubatch.embd)  || (h      && h->ne[1]      == params.ubatch.n_tokens);
+    res &= (!params.ubatch.embd && !params.ubatch.embd_device) ||
+           (embd && embd->ne[1] == params.ubatch.n_tokens);
+    res &= (!params.ubatch.embd && !params.ubatch.embd_device) ||
+           (h && h->ne[1] == params.ubatch.n_tokens);
 
     return res;
 }

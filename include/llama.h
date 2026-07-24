@@ -246,6 +246,13 @@ extern "C" {
         int32_t      *  n_seq_id;
         llama_seq_id ** seq_id;
         int8_t       *  logits;   // TODO: rename this to "output"
+
+        // [EXPERIMENTAL] Optional opaque ggml_tensor input for a device-to-device
+        // embedding handoff. When non-NULL, token must be NULL and embd may be
+        // NULL. The tensor must have F32 layout [n_embd, n_tokens], live on a
+        // backend visible to this context, and remain valid until llama_decode()
+        // returns. This is intentionally opaque in the public API.
+        void         *  embd_device;
     } llama_batch;
 
     enum llama_model_kv_override_type {

@@ -6,6 +6,7 @@
 #include "token2wav/token2wav-backend-policy.h"
 #include "sampling-policy.h"
 #include "token-trace.h"
+#include "tts-device-head.h"
 #include "wav-chunk-utils.h"
 
 #include "llama.h"
@@ -47,6 +48,7 @@
 #include <fstream>
 #include <iomanip>
 #include <chrono>
+#include <cinttypes>
 #include <cmath>
 #include <sstream>
 #include <random>
@@ -2610,6 +2612,40 @@ bool prefill_with_emb_tts(struct omni_context* ctx_omni, common_params* params, 
     return true;
 }
 
+// Feed one accelerator-resident audio-code embedding back into MiniCPMTTS.
+// The source tensor is opaque outside llama.cpp and is copied device-to-device
+// into the model input; unlike prefill_with_emb_tts, no host embedding exists.
+static bool prefill_with_device_emb_tts(
+        struct omni_context * ctx_omni,
+        const llama_device_tensor & embed,
+        int * n_past_tts) {
+    if (!ctx_omni || !ctx_omni->ctx_tts_llama || !ctx_omni->model_tts ||
+        !n_past_tts || !embed.tensor || !embed.backend) {
+        LOG_ERR("%s: invalid TTS device embedding contract\n", __func__);
+        return false;
+    }
+
+    const int n_embd = llama_model_n_embd(llama_get_model(ctx_omni->ctx_tts_llama));
+    if (embed.type != GGML_TYPE_F32 || embed.ne[0] != n_embd || embed.ne[1] != 1) {
+        LOG_ERR("%s: expected F32 device embedding [%d,1], got type=%d shape=[%" PRId64 ",%" PRId64 "]\n",
+                __func__, n_embd, embed.type, embed.ne[0], embed.ne[1]);
+        return false;
+    }
+
+    llama_pos pos = *n_past_tts;
+    llama_batch batch = {};
+    batch.n_tokens = 1;
+    batch.embd_device = embed.tensor;
+    batch.pos = &pos;
+
+    if (llama_decode(ctx_omni->ctx_tts_llama, batch) != 0) {
+        LOG_ERR("%s: device embedding decode failed at n_past=%d\n", __func__, *n_past_tts);
+        return false;
+    }
+    ++(*n_past_tts);
+    return true;
+}
+
 // Save logits to file for Python comparison
 static void save_logits_to_file(const char* filepath, const float* logits, int num_tokens, int token_index) {
     char full_path[512];
@@ -2904,6 +2940,131 @@ static int nucleus_sampling_with_min_keep_tts(
     return filtered_indices.back();  // Fallback
 }
 
+static llama_token sample_tts_token_device(
+        struct common_sampler * smpl,
+        struct omni_context * ctx_omni,
+        common_params * params,
+        int * n_past_tts,
+        const std::vector<llama_token> * tokens_for_penalty,
+        bool skip_processors,
+        bool force_no_eos,
+        bool skip_eos_prefill,
+        int repetition_window) {
+    constexpr llama_token audio_bos_token_id = 151687;
+    constexpr int32_t num_audio_tokens = 6562;
+
+    if (!ctx_omni->tts_device_head_enabled || !ctx_omni->tts_device_head_runner) {
+        LOG_ERR("%s: CANN TTS head was requested without an initialized runner\n", __func__);
+        return 0;
+    }
+
+    // The first production cut is deliberately deterministic.  The backend
+    // supports seeded dist/top-k/top-p graphs, but the legacy CPU simplex and
+    // duplex paths have different first-code warper semantics.  Do not claim
+    // stochastic equivalence until fixed-uniform replay covers both policies.
+    const bool greedy = params->sampling.temp <= 0.0f;
+    if (!greedy) {
+        LOG_ERR("%s: OMNI_TTS_HEAD=cann currently requires --temp 0; "
+                "stochastic CPU/NPU policy parity is not verified\n", __func__);
+        return 0;
+    }
+
+    llama_device_tensor hidden = {};
+    if (!llama_get_embeddings_device_ith(ctx_omni->ctx_tts_llama, -1, &hidden)) {
+        LOG_ERR("%s: failed to acquire the last TTS device hidden\n", __func__);
+        return 0;
+    }
+
+    std::string error;
+    if (!ctx_omni->tts_device_head_runner->initialized()) {
+        if (!ctx_omni->head_code_weight || !ctx_omni->emb_code_weight ||
+            ctx_omni->head_code_hidden_size != hidden.ne[0] ||
+            ctx_omni->head_code_num_audio_tokens != num_audio_tokens ||
+            ctx_omni->emb_code_hidden_size != hidden.ne[0] ||
+            ctx_omni->emb_code_vocab_size != num_audio_tokens ||
+            ctx_omni->emb_code_stored_as_transposed) {
+            LOG_ERR("%s: TTS host weight layout cannot initialize the device head\n", __func__);
+            return 0;
+        }
+        if (!ctx_omni->tts_device_head_runner->initialize(
+                    hidden,
+                    ctx_omni->head_code_weight,
+                    ctx_omni->emb_code_weight,
+                    static_cast<int32_t>(hidden.ne[0]),
+                    num_audio_tokens,
+                    /*temperature=*/0.8f,
+                    /*top_p=*/0.85f,
+                    /*top_k=*/25,
+                    /*min_keep=*/3,
+                    /*repetition_penalty=*/1.05f,
+                    repetition_window,
+                    params->sampling.seed,
+                    /*greedy=*/true,
+                    /*require_cann=*/true,
+                    ctx_omni->tts_device_head_trace,
+                    error)) {
+            LOG_ERR("%s: device head initialization failed: %s\n", __func__, error.c_str());
+            return 0;
+        }
+        // The device runner now owns persistent copies of both matrices.
+        // Keeping the 2 x 6562 x 768 F32 host buffers would defeat the memory
+        // contract and make accidental CPU fallback possible.
+        free(ctx_omni->head_code_weight);
+        ctx_omni->head_code_weight = nullptr;
+        free(ctx_omni->emb_code_weight);
+        ctx_omni->emb_code_weight = nullptr;
+    }
+
+    omni::tts_device_head_step step;
+    // Greedy CPU behavior does not apply repetition or EOS masking.  Preserve
+    // that exact contract even when the caller supplied those stochastic-only
+    // policy flags.
+    step.skip_repetition = true;
+    step.force_no_eos = false;
+    if (tokens_for_penalty) {
+        step.recent_relative_tokens.reserve(tokens_for_penalty->size());
+        for (llama_token token : *tokens_for_penalty) {
+            const int32_t relative = token - audio_bos_token_id;
+            if (relative >= 0 && relative < num_audio_tokens) {
+                step.recent_relative_tokens.push_back(relative);
+            }
+        }
+    }
+    GGML_UNUSED(skip_processors);
+    GGML_UNUSED(force_no_eos);
+
+    int32_t relative = -1;
+    llama_device_tensor selected_embedding = {};
+    if (!ctx_omni->tts_device_head_runner->forward(
+                hidden, step, relative, selected_embedding, error)) {
+        LOG_ERR("%s: device head forward failed: %s\n", __func__, error.c_str());
+        return 0;
+    }
+
+    const llama_token id = audio_bos_token_id + relative;
+    common_sampler_accept(smpl, id, true);
+    const bool is_eos = relative == num_audio_tokens - 1;
+    if (is_eos && skip_eos_prefill) {
+        return id;
+    }
+    if (!prefill_with_device_emb_tts(ctx_omni, selected_embedding, n_past_tts)) {
+        LOG_ERR("%s: failed to feed selected device embedding to MiniCPMTTS\n", __func__);
+        return 0;
+    }
+    return id;
+}
+
+static bool tts_code_weights_ready(const struct omni_context * ctx_omni) {
+    const bool host_ready =
+            ctx_omni->head_code_weight != nullptr &&
+            ctx_omni->emb_code_weight != nullptr;
+    const bool device_ready =
+            ctx_omni->tts_device_head_enabled &&
+            ctx_omni->tts_device_head_runner &&
+            ctx_omni->tts_device_head_runner->initialized();
+    return host_ready || device_ready;
+}
+
 // ==================== 单工版本的 sample_tts_token ====================
 // 直接从 omni_sinplex.cpp 复制，保证单工模式行为完全一致
 // 🔧 [与 Python 对齐] 添加 is_final_text_chunk 参数：
@@ -2938,6 +3099,19 @@ static llama_token sample_tts_token_simplex(struct common_sampler * smpl, struct
             return 0;
         }
         *n_past_tts = condition_n_past;
+    }
+
+    if (ctx_omni->tts_device_head_enabled) {
+        return sample_tts_token_device(
+                smpl,
+                ctx_omni,
+                params,
+                n_past_tts,
+                all_generated_tokens,
+                /*skip_processors=*/is_audio_bos,
+                force_no_eos,
+                /*skip_eos_prefill=*/!is_final_text_chunk,
+                /*repetition_window=*/8);
     }
     
     // 使用 head_code 层计算 audio logits
@@ -3197,6 +3371,24 @@ llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context *
         
         // Update n_past_tts to match the condition length
         *n_past_tts = condition_n_past;
+    }
+
+    if (ctx_omni->tts_device_head_enabled) {
+        const std::vector<llama_token> * tokens_for_penalty =
+                ctx_omni->duplex_mode
+                ? (chunk_generated_tokens ? chunk_generated_tokens : all_generated_tokens)
+                : all_generated_tokens;
+        return sample_tts_token_device(
+                smpl,
+                ctx_omni,
+                params,
+                n_past_tts,
+                tokens_for_penalty,
+                skip_processors,
+                force_no_eos,
+                /*skip_eos_prefill=*/
+                    ctx_omni->duplex_mode && !is_final_text_chunk,
+                /*repetition_window=*/16);
     }
     
     // 1. 获取TTS模型的最后一个位置的hidden state
@@ -4155,6 +4347,42 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
     auto ctx_omni = new omni_context();
 
     {
+        omni::tts_device_head_config config;
+        std::string error;
+        if (!omni::tts_device_head_parse_config(
+                    std::getenv("OMNI_TTS_HEAD"),
+                    std::getenv("OMNI_TTS_DEVICE_SAMPLER"),
+                    std::getenv("OMNI_TTS_TRACE"),
+                    config,
+                    error)) {
+            LOG_ERR("TTS device-head configuration failed: %s\n", error.c_str());
+            delete ctx_omni;
+            return nullptr;
+        }
+        ctx_omni->tts_device_head_enabled = config.mode == omni::tts_head_mode::cann;
+        ctx_omni->tts_device_head_trace = config.trace;
+        if (ctx_omni->tts_device_head_enabled) {
+            if (std::getenv("TTS_LOGITS_DEBUG_DIR") ||
+                std::getenv("TTS_OUTPUT_DIR") ||
+                std::getenv("TTS_SAVE_HIDDEN_STATES_DIR")) {
+                LOG_ERR("OMNI_TTS_HEAD=cann is incompatible with host hidden/logits debug dumps\n");
+                delete ctx_omni;
+                return nullptr;
+            }
+#ifndef GGML_USE_CANN
+            LOG_ERR("OMNI_TTS_HEAD=cann requires a GGML_CANN build\n");
+            delete ctx_omni;
+            return nullptr;
+#else
+            ctx_omni->tts_device_head_runner = std::make_shared<omni::tts_device_head>();
+            LOG_INF("TTS head mode: cann (device sampler enabled, fail-closed)\n");
+#endif
+        } else {
+            LOG_INF("TTS head mode: cpu (legacy path)\n");
+        }
+    }
+
+    {
         std::string error;
         if (!omni::token_trace::initialize(
                 std::getenv("OMNI_TOKEN_TRACE"),
@@ -4328,6 +4556,9 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         ctx_omni->model_tts = tts_model;
         ctx_omni->ctx_tts_llama = ctx_tts_llama;
         ctx_omni->ctx_tts_sampler = tts_sampler;
+        if (ctx_omni->tts_device_head_enabled) {
+            llama_set_embeddings_device_only(ctx_tts_llama, true);
+        }
         
         // Load TTS weights from GGUF file
         print_with_timestamp("TTS: loading weights from GGUF (emb_code, emb_text, projector_semantic, head_code)...\n");
@@ -4971,6 +5202,9 @@ void omni_free(struct omni_context * ctx_omni) {
     audition_free(ctx_omni->ctx_audio);
     
     if (ctx_omni->use_tts) {
+        // The device-head owns buffers allocated from the TTS context backend;
+        // release them before llama_free tears that backend down.
+        ctx_omni->tts_device_head_runner.reset();
         llama_free(ctx_omni->ctx_tts_llama);
         llama_free_model(ctx_omni->model_tts);
         common_sampler_free(ctx_omni->ctx_tts_sampler);
@@ -5494,7 +5728,7 @@ static bool generate_audio_tokens_local_simplex(
         return false;
     }
     
-    if (!ctx_omni->head_code_weight || !ctx_omni->emb_code_weight) {
+    if (!tts_code_weights_ready(ctx_omni)) {
         LOG_ERR("TTS Simplex: TTS weights not loaded\n");
         return false;
     }
@@ -5910,7 +6144,7 @@ static bool generate_audio_tokens_local(
     }
     
     // Verify TTS weights are loaded
-    if (!ctx_omni->head_code_weight || !ctx_omni->emb_code_weight) {
+    if (!tts_code_weights_ready(ctx_omni)) {
         LOG_ERR("TTS Local: TTS weights not loaded (head_code or emb_code)\n");
         return false;
     }

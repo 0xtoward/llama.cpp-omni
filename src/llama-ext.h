@@ -104,3 +104,25 @@ LLAMA_API float * llama_get_embeddings_pre_norm    (struct llama_context * ctx);
 
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_pre_norm_ith(struct llama_context * ctx, int32_t i);
+
+// Opaque device tensor handoff used by accelerator-side auxiliary heads.
+// Handles are borrowed: they do not own the tensor/backend and are valid only
+// until the originating context executes another graph.
+struct llama_device_tensor {
+    void * tensor;
+    void * backend;
+    int64_t ne[4];
+    int32_t type;
+};
+
+// Keep the normal embedding graph output on its execution backend without
+// scheduling the automatic embedding D2H copy. Host embedding getters return
+// nullptr while this mode is active.
+LLAMA_API void llama_set_embeddings_device_only(struct llama_context * ctx, bool value);
+
+// Return a borrowed handle for an M=1 embedding output. This deliberately
+// fails for multi-row outputs so callers cannot silently consume the wrong row.
+LLAMA_API bool llama_get_embeddings_device_ith(
+        struct llama_context * ctx,
+        int32_t i,
+        struct llama_device_tensor * out);

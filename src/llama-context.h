@@ -83,6 +83,7 @@ struct llama_context {
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
+    bool get_embeddings_device_ith(int32_t i, llama_device_tensor * out);
 
     float * get_embeddings_pre_norm();
     float * get_embeddings_pre_norm_ith(int32_t i);
@@ -110,6 +111,7 @@ struct llama_context {
     void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);
 
     void set_embeddings (bool value);
+    void set_embeddings_device_only(bool value);
     void set_embeddings_pre_norm(bool value, bool masked);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
@@ -281,6 +283,10 @@ private:
     // embeddings output (2-dimensional array: [n_outputs][n_embd])
     // populated only when pooling_type == LLAMA_POOLING_TYPE_NONE
     buffer_view<float> embd = {nullptr, 0};
+
+    // When true, t_embd remains a graph output on its backend but decode does
+    // not copy it to the host-side embd buffer.
+    bool embeddings_device_only = false;
 
     // hidden state before the final output norm (2-dimensional array: [n_outputs][n_embd])
     // populated only when cparams.embeddings_pre_norm is enabled and the model graph
