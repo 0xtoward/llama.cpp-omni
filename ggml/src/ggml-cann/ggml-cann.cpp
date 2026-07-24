@@ -2472,6 +2472,7 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
 #ifdef GGML_CANN_USE_ATB
         std::vector<std::unique_ptr<ggml_cann_pool_alloc>> kv_pair_allocations;
         std::unique_ptr<ggml_cann_pool_alloc> kv_pair_shared_slots;
+        ggml_tensor * kv_pair_pending_key = nullptr;
 #endif
         for (int i = 0; i < cgraph->n_nodes; i++) {
             ggml_tensor * node = cgraph->nodes[i];
@@ -2492,25 +2493,38 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
             if (opt_kv_pair && node->op == GGML_OP_SET_ROWS) {
                 const bool key_candidate = ggml_cann_cache_layer(node, 'k') >= 0;
                 const bool value_candidate = ggml_cann_cache_layer(node, 'v') >= 0;
-                if (key_candidate || value_candidate) {
-                    cann_ctx->experiment_kv_pair_candidates++;
-                    std::string reason;
-                    if (!key_candidate || i + 1 >= cgraph->n_nodes ||
-                        !ggml_cann_match_kv_pair(node, cgraph->nodes[i + 1], reason)) {
+                if (key_candidate) {
+                    if (kv_pair_pending_key != nullptr) {
                         GGML_ABORT(
-                            "kv_pair candidate %s cannot be fused: %s; "
-                            "requires adjacent F16 non-transposed K/V cache writes",
+                            "kv_pair encountered key %s before pending key %s was paired",
                             ggml_get_name(node),
+                            ggml_get_name(kv_pair_pending_key));
+                    }
+                    cann_ctx->experiment_kv_pair_candidates++;
+                    kv_pair_pending_key = node;
+                    continue;
+                }
+                if (value_candidate) {
+                    std::string reason;
+                    if (kv_pair_pending_key == nullptr ||
+                        !ggml_cann_match_kv_pair(kv_pair_pending_key, node, reason)) {
+                        GGML_ABORT(
+                            "kv_pair value %s cannot pair with pending key %s: %s; "
+                            "requires F16 non-transposed K/V cache writes",
+                            ggml_get_name(node),
+                            kv_pair_pending_key != nullptr
+                                ? ggml_get_name(kv_pair_pending_key)
+                                : "<none>",
                             reason.empty() ? "missing_adjacent_value" : reason.c_str());
                     }
                     ggml_cann_execute_kv_pair(
                         *cann_ctx,
+                        kv_pair_pending_key,
                         node,
-                        cgraph->nodes[i + 1],
                         kv_pair_allocations,
                         kv_pair_shared_slots);
                     cann_ctx->experiment_kv_pair_hits++;
-                    i++;
+                    kv_pair_pending_key = nullptr;
                     continue;
                 }
             }
@@ -2533,6 +2547,13 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
             }
             GGML_ASSERT(ok);
         }
+#ifdef GGML_CANN_USE_ATB
+        if (kv_pair_pending_key != nullptr) {
+            GGML_ABORT(
+                "kv_pair key %s reached graph end without matching value write",
+                ggml_get_name(kv_pair_pending_key));
+        }
+#endif
     }
 
 #ifdef USE_ACL_GRAPH
