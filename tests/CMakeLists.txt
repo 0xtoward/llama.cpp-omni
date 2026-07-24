@@ -243,6 +243,10 @@ endif()
 llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)
 llama_build_and_test(test-cann-experiment-config.cpp)
+llama_build_and_test(
+    test-cann-cast-trace.cpp
+    ../ggml/src/ggml-cann/cast-trace.cpp
+)
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")

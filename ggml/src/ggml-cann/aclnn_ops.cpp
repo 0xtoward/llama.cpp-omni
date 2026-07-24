@@ -21,6 +21,7 @@
  */
 
 #include "aclnn_ops.h"
+#include "cast-trace.h"
 
 #include "ggml-impl.h"
 #include "ggml.h"
@@ -87,6 +88,7 @@
 #include <aclnnop/aclnn_zero.h>
 #include <float.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <exception>
@@ -95,6 +97,92 @@
 #define GGML_COMMON_DECL_C
 
 #include "../ggml-common.h"
+
+namespace {
+
+const char * ggml_cann_cast_dtype_name(aclDataType value) {
+    switch (value) {
+        case ACL_FLOAT:
+            return "f32";
+        case ACL_FLOAT16:
+            return "f16";
+        case ACL_BF16:
+            return "bf16";
+        case ACL_INT64:
+            return "i64";
+        case ACL_INT32:
+            return "i32";
+        case ACL_INT8:
+            return "i8";
+        case ACL_UINT8:
+            return "u8";
+        case ACL_BOOL:
+            return "bool";
+        default:
+            return "acl_unknown";
+    }
+}
+
+size_t ggml_cann_cast_dtype_size(aclDataType value) {
+    switch (value) {
+        case ACL_FLOAT:
+        case ACL_INT32:
+            return 4;
+        case ACL_FLOAT16:
+        case ACL_BF16:
+            return 2;
+        case ACL_INT64:
+            return 8;
+        case ACL_INT8:
+        case ACL_UINT8:
+        case ACL_BOOL:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+const char * ggml_cann_cast_tensor_name(
+        const ggml_tensor * tensor, const char * fallback) {
+    if (tensor) {
+        const char * name = ggml_get_name(tensor);
+        if (name && name[0] != '\0') {
+            return name;
+        }
+    }
+    return fallback;
+}
+
+ggml_cann_cast_trace::event ggml_cann_make_cast_trace_event(
+        const ggml_tensor * shape_tensor,
+        aclDataType src_dtype,
+        aclDataType dst_dtype,
+        ggml_cann_cast_trace::origin cast_origin,
+        const char * producer,
+        const char * consumer,
+        ggml_cann_cast_trace::domain cast_domain =
+            ggml_cann_cast_trace::domain::generic) {
+    ggml_cann_cast_trace::event value;
+    value.cast_origin = cast_origin;
+    value.producer = producer ? producer : "";
+    value.consumer = consumer ? consumer : "";
+    value.src_dtype = ggml_cann_cast_dtype_name(src_dtype);
+    value.dst_dtype = ggml_cann_cast_dtype_name(dst_dtype);
+    if (shape_tensor) {
+        value.shape.assign(
+            shape_tensor->ne, shape_tensor->ne + GGML_MAX_DIMS);
+        value.bytes = static_cast<uint64_t>(ggml_nelements(shape_tensor)) *
+                      ggml_cann_cast_dtype_size(dst_dtype);
+    }
+    value.cast_domain =
+        cast_domain == ggml_cann_cast_trace::domain::generic
+            ? ggml_cann_cast_trace::infer_domain(
+                  value.producer, value.consumer)
+            : cast_domain;
+    return value;
+}
+
+}  // namespace
 
 void bcast_shape(ggml_tensor *    src0,
                  ggml_tensor *    src1,
@@ -293,11 +381,29 @@ static void aclnn_repeat(ggml_backend_cann_context & ctx,
  * @param cast_data_type The target data type to which the source tensor will be
  * casted.
  */
+template <typename TraceFactory>
 static void aclnn_cast(ggml_backend_cann_context & ctx,
                        aclTensor *                 acl_src,
                        aclTensor *                 acl_dst,
-                       aclDataType                 cast_data_type) {
+                       aclDataType                 cast_data_type,
+                       TraceFactory &&             trace_factory) {
+    if (!ggml_cann_cast_trace::enabled()) {
+        GGML_CANN_CALL_ACLNN_OP(ctx, Cast, acl_src, cast_data_type, acl_dst);
+        return;
+    }
+
+    const auto start = std::chrono::steady_clock::now();
     GGML_CANN_CALL_ACLNN_OP(ctx, Cast, acl_src, cast_data_type, acl_dst);
+    const auto stop = std::chrono::steady_clock::now();
+    const uint64_t host_submit_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(stop - start).count());
+    try {
+        ggml_cann_cast_trace::record(trace_factory(), host_submit_ns);
+    } catch (...) {
+        // The Cast already completed. Observability must never change inference
+        // behavior if metadata allocation or formatting fails.
+        ggml_cann_cast_trace::report_error("metadata");
+    }
 }
 
 void ggml_cann_cast_contiguous(
@@ -321,7 +427,17 @@ void ggml_cann_cast_contiguous(
         dst_ne,
         dst_nb,
         GGML_MAX_DIMS);
-    aclnn_cast(ctx, acl_src.get(), acl_dst.get(), ggml_cann_type_mapping(dst_type));
+    const aclDataType src_dtype = ggml_cann_type_mapping(src->type);
+    const aclDataType dst_dtype = ggml_cann_type_mapping(dst_type);
+    aclnn_cast(
+        ctx, acl_src.get(), acl_dst.get(), dst_dtype,
+        [src, src_dtype, dst_dtype] {
+            return ggml_cann_make_cast_trace_event(
+                src, src_dtype, dst_dtype,
+                ggml_cann_cast_trace::origin::generic,
+                ggml_cann_cast_tensor_name(src, "cast_contiguous_src"),
+                "cast_contiguous_dst");
+        });
 }
 
 void ggml_cann_cast_i64_to_i32(
@@ -347,7 +463,16 @@ void ggml_cann_cast_i64_to_i32(
         dst_ne,
         dst_nb,
         1);
-    aclnn_cast(ctx, acl_src.get(), acl_dst.get(), ACL_INT32);
+    aclnn_cast(
+        ctx, acl_src.get(), acl_dst.get(), ACL_INT32,
+        [src] {
+            return ggml_cann_make_cast_trace_event(
+                src, ACL_INT64, ACL_INT32,
+                ggml_cann_cast_trace::origin::kv,
+                ggml_cann_cast_tensor_name(src, "kv_slot_i64"),
+                "kv_slot_i32",
+                ggml_cann_cast_trace::domain::thinker);
+        });
 }
 
 void ggml_cann_repeat(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
@@ -1076,7 +1201,17 @@ void ggml_cann_dup(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
         if (dst->type == src0->type) {
             cann_copy(ctx, acl_src.get(), acl_dst.get());
         } else {
-            aclnn_cast(ctx, acl_src.get(), acl_dst.get(), ggml_cann_type_mapping(dst->type));
+            const aclDataType src_dtype = ggml_cann_type_mapping(src0->type);
+            const aclDataType dst_dtype = ggml_cann_type_mapping(dst->type);
+            aclnn_cast(
+                ctx, acl_src.get(), acl_dst.get(), dst_dtype,
+                [src0, dst, src_dtype, dst_dtype] {
+                    return ggml_cann_make_cast_trace_event(
+                        dst, src_dtype, dst_dtype,
+                        ggml_cann_cast_trace::origin::generic,
+                        ggml_cann_cast_tensor_name(src0, "dup_src"),
+                        ggml_cann_cast_tensor_name(dst, "dup_dst"));
+                });
         }
     } else {
         void *               src_trans_buffer = src0->data;
@@ -1110,7 +1245,17 @@ void ggml_cann_dup(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
         if (dst->type == src0->type) {
             cann_copy(ctx, trans_acl_src.get(), acl_dst.get());
         } else {
-            aclnn_cast(ctx, trans_acl_src.get(), acl_dst.get(), ggml_cann_type_mapping(dst->type));
+            const aclDataType src_dtype = ggml_cann_type_mapping(src0->type);
+            const aclDataType dst_dtype = ggml_cann_type_mapping(dst->type);
+            aclnn_cast(
+                ctx, trans_acl_src.get(), acl_dst.get(), dst_dtype,
+                [src0, dst, src_dtype, dst_dtype] {
+                    return ggml_cann_make_cast_trace_event(
+                        dst, src_dtype, dst_dtype,
+                        ggml_cann_cast_trace::origin::generic,
+                        ggml_cann_cast_tensor_name(src0, "dup_transposed_src"),
+                        ggml_cann_cast_tensor_name(dst, "dup_dst"));
+                });
         }
     }
 }
@@ -1509,7 +1654,17 @@ void ggml_cann_im2col(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
         tmp_cast_tensor =
             ggml_cann_create_tensor(tmp_cast_buffer, ggml_cann_type_mapping(dst->type), ggml_type_size(dst->type),
                                     tmp_im2col_ne, temp_cast_nb, GGML_MAX_DIMS - 1, ACL_FORMAT_ND);
-        aclnn_cast(ctx, tmp_im2col_tensor.get(), tmp_cast_tensor.get(), ggml_cann_type_mapping(dst->type));
+        const aclDataType src_dtype = ggml_cann_type_mapping(src1->type);
+        const aclDataType dst_dtype = ggml_cann_type_mapping(dst->type);
+        aclnn_cast(
+            ctx, tmp_im2col_tensor.get(), tmp_cast_tensor.get(), dst_dtype,
+            [src1, dst, src_dtype, dst_dtype] {
+                return ggml_cann_make_cast_trace_event(
+                    dst, src_dtype, dst_dtype,
+                    ggml_cann_cast_trace::origin::generic,
+                    ggml_cann_cast_tensor_name(src1, "im2col_output"),
+                    ggml_cann_cast_tensor_name(dst, "im2col_cast"));
+            });
     }
 
     // post-processing
@@ -1975,7 +2130,17 @@ void ggml_cann_get_rows(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
                 acl_tensor_ptr acl_src_cast = ggml_cann_create_tensor(
                     src_cast_allocator.get(), ggml_cann_type_mapping(dst->type), ggml_type_size(dst->type),
                     src0->ne, src_cast_nb, GGML_MAX_DIMS);
-                aclnn_cast(ctx, acl_src0.get(), acl_src_cast.get(), ggml_cann_type_mapping(dst->type));
+                const aclDataType src_dtype = ggml_cann_type_mapping(src0->type);
+                const aclDataType dst_dtype = ggml_cann_type_mapping(dst->type);
+                aclnn_cast(
+                    ctx, acl_src0.get(), acl_src_cast.get(), dst_dtype,
+                    [src0, dst, src_dtype, dst_dtype] {
+                        return ggml_cann_make_cast_trace_event(
+                            src0, src_dtype, dst_dtype,
+                            ggml_cann_cast_trace::origin::generic,
+                            ggml_cann_cast_tensor_name(src0, "get_rows_src"),
+                            ggml_cann_cast_tensor_name(dst, "get_rows_dst"));
+                    });
 
                 gather_batched(src_cast_allocator.get(),
                                ggml_cann_type_mapping(dst->type), ggml_type_size(dst->type),
@@ -2098,7 +2263,18 @@ void ggml_cann_set_rows(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
                 acl_tensor_ptr acl_src_cast = ggml_cann_create_tensor(
                     src_cast_allocator.get(), ggml_cann_type_mapping(dst->type), ggml_type_size(dst->type),
                     src0->ne, src_cast_nb, GGML_MAX_DIMS);
-                aclnn_cast(ctx, acl_src0.get(), acl_src_cast.get(), ggml_cann_type_mapping(dst->type));
+                const aclDataType src_dtype = ggml_cann_type_mapping(src0->type);
+                const aclDataType dst_dtype = ggml_cann_type_mapping(dst->type);
+                const ggml_tensor * cache = dst->src[2];
+                aclnn_cast(
+                    ctx, acl_src0.get(), acl_src_cast.get(), dst_dtype,
+                    [src0, cache, src_dtype, dst_dtype] {
+                        return ggml_cann_make_cast_trace_event(
+                            src0, src_dtype, dst_dtype,
+                            ggml_cann_cast_trace::origin::kv,
+                            ggml_cann_cast_tensor_name(src0, "kv_current"),
+                            ggml_cann_cast_tensor_name(cache, "kv_cache"));
+                    });
 
                 scatter_batched(src_cast_allocator.get(),
                                 ggml_cann_type_mapping(dst->type), ggml_type_size(dst->type),
@@ -2257,7 +2433,16 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context & ctx, ggml_tensor
 
         acl_tensor_ptr acl_input_tensor = ggml_cann_create_tensor(input_buffer, ACL_FLOAT16, input_elem_size,
                                                                   input_cast_ne, input_cast_nb, GGML_MAX_DIMS);
-        aclnn_cast(ctx, acl_src1_tensor.get(), acl_input_tensor.get(), ACL_FLOAT16);
+        const aclDataType src_dtype = ggml_cann_type_mapping(src1->type);
+        aclnn_cast(
+            ctx, acl_src1_tensor.get(), acl_input_tensor.get(), ACL_FLOAT16,
+            [src1, dst, src_dtype] {
+                return ggml_cann_make_cast_trace_event(
+                    src1, src_dtype, ACL_FLOAT16,
+                    ggml_cann_cast_trace::origin::q8,
+                    ggml_cann_cast_tensor_name(src1, "q8_activation"),
+                    ggml_cann_cast_tensor_name(dst, "q8_matmul"));
+            });
     }
 
     // output
@@ -2345,7 +2530,16 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context & ctx, ggml_tensor
         acl_tensor_ptr acl_output_tensor = ggml_cann_create_tensor(output_buffer, ACL_FLOAT16, output_elem_size,
                                                                    output_cast_ne, output_cast_nb, GGML_MAX_DIMS);
         acl_tensor_ptr acl_dst_tensor    = ggml_cann_create_tensor(dst);
-        aclnn_cast(ctx, acl_output_tensor.get(), acl_dst_tensor.get(), ggml_cann_type_mapping(dst->type));
+        const aclDataType dst_dtype = ggml_cann_type_mapping(dst->type);
+        aclnn_cast(
+            ctx, acl_output_tensor.get(), acl_dst_tensor.get(), dst_dtype,
+            [dst, dst_dtype] {
+                return ggml_cann_make_cast_trace_event(
+                    dst, ACL_FLOAT16, dst_dtype,
+                    ggml_cann_cast_trace::origin::q8,
+                    "q8_matmul_f16_output",
+                    ggml_cann_cast_tensor_name(dst, "q8_output"));
+            });
     }
 }
 
@@ -3070,7 +3264,15 @@ void ggml_cann_rope(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
         aclnn_mul(ctx, acl_src.get(), acl_cos_reshape_tensor.get(), input_fp32_tensor1.get());
         aclnn_mul(ctx, acl_input_roll_mul_scale_tensor.get(), acl_sin_reshape_tensor.get(), input_fp32_tensor2.get());
         aclnn_add(ctx, input_fp32_tensor1.get(), input_fp32_tensor2.get(), output_fp32_tensor.get());
-        aclnn_cast(ctx, output_fp32_tensor.get(), acl_dst.get(), ACL_FLOAT16);
+        aclnn_cast(
+            ctx, output_fp32_tensor.get(), acl_dst.get(), ACL_FLOAT16,
+            [src0, dst] {
+                return ggml_cann_make_cast_trace_event(
+                    dst, ACL_FLOAT, ACL_FLOAT16,
+                    ggml_cann_cast_trace::origin::generic,
+                    ggml_cann_cast_tensor_name(src0, "rope_fp32_output"),
+                    ggml_cann_cast_tensor_name(dst, "rope_f16_output"));
+            });
     }
     return;
 #endif
@@ -3102,7 +3304,15 @@ void ggml_cann_rope(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
                                                        src_dst_trans_nb, GGML_MAX_DIMS);
         acl_dst_trans_tensor = ggml_cann_create_tensor(dst_trans_buffer, ACL_FLOAT, sizeof(float), dst->ne,
                                                        src_dst_trans_nb, GGML_MAX_DIMS);
-        aclnn_cast(ctx, acl_src.get(), acl_src_trans_tensor.get(), ACL_FLOAT);
+        aclnn_cast(
+            ctx, acl_src.get(), acl_src_trans_tensor.get(), ACL_FLOAT,
+            [src0, dst] {
+                return ggml_cann_make_cast_trace_event(
+                    src0, ACL_FLOAT16, ACL_FLOAT,
+                    ggml_cann_cast_trace::origin::generic,
+                    ggml_cann_cast_tensor_name(src0, "rope_f16_input"),
+                    ggml_cann_cast_tensor_name(dst, "rope_fp32_input"));
+            });
     }
 
     // Step 2: Prepare head tensors for tail splitting if needed
@@ -3212,7 +3422,15 @@ void ggml_cann_rope(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
 
     // Step 5: Cast back to F16 if needed
     if (src_dst_need_trans) {
-        aclnn_cast(ctx, acl_dst_trans_tensor.get(), acl_dst.get(), ACL_FLOAT16);
+        aclnn_cast(
+            ctx, acl_dst_trans_tensor.get(), acl_dst.get(), ACL_FLOAT16,
+            [src0, dst] {
+                return ggml_cann_make_cast_trace_event(
+                    dst, ACL_FLOAT, ACL_FLOAT16,
+                    ggml_cann_cast_trace::origin::generic,
+                    ggml_cann_cast_tensor_name(src0, "rope_fp32_output"),
+                    ggml_cann_cast_tensor_name(dst, "rope_f16_output"));
+            });
     }
 }
 
@@ -3708,7 +3926,16 @@ static void ggml_cann_mul_mat_id_quant(ggml_backend_cann_context & ctx, ggml_ten
 
         acl_tensor_ptr src_tensor = ggml_cann_create_tensor(tensor);
         acl_tensor_ptr f16_tensor = ggml_cann_create_tensor(buffer, ACL_FLOAT16, f16_elem_size, ne, nb, GGML_MAX_DIMS);
-        aclnn_cast(ctx, src_tensor.get(), f16_tensor.get(), ACL_FLOAT16);
+        const aclDataType src_dtype = ggml_cann_type_mapping(tensor->type);
+        aclnn_cast(
+            ctx, src_tensor.get(), f16_tensor.get(), ACL_FLOAT16,
+            [tensor, src_dtype] {
+                return ggml_cann_make_cast_trace_event(
+                    tensor, src_dtype, ACL_FLOAT16,
+                    ggml_cann_cast_trace::origin::q8,
+                    ggml_cann_cast_tensor_name(tensor, "q8_moe_activation"),
+                    "q8_moe_matmul");
+            });
 
         return buffer;
     };
@@ -3827,7 +4054,16 @@ static void ggml_cann_mul_mat_id_quant(ggml_backend_cann_context & ctx, ggml_ten
             ggml_cann_create_tensor(output_buffer, ACL_FLOAT16, f16_elem_size, ne, nb, GGML_MAX_DIMS);
         acl_tensor_ptr dst_tensor = ggml_cann_create_tensor(dst);
 
-        aclnn_cast(ctx, f16_output.get(), dst_tensor.get(), ggml_cann_type_mapping(dst->type));
+        const aclDataType dst_dtype = ggml_cann_type_mapping(dst->type);
+        aclnn_cast(
+            ctx, f16_output.get(), dst_tensor.get(), dst_dtype,
+            [dst, dst_dtype] {
+                return ggml_cann_make_cast_trace_event(
+                    dst, ACL_FLOAT16, dst_dtype,
+                    ggml_cann_cast_trace::origin::q8,
+                    "q8_moe_f16_output",
+                    ggml_cann_cast_tensor_name(dst, "q8_moe_output"));
+            });
     }
 }
 
@@ -3914,7 +4150,17 @@ void ggml_cann_flash_attn_ext(ggml_backend_cann_context & ctx, ggml_tensor * dst
 
             acl_q_tensor = ggml_cann_create_tensor(src0_f16_buffer, faDataType, faElemSize, src0_f16_ne, src0_f16_nb,
                                                    GGML_MAX_DIMS);
-            aclnn_cast(ctx, acl_src0_f32_tensor.get(), acl_q_tensor.get(), faDataType);
+            const aclDataType src_dtype = ggml_cann_type_mapping(src0->type);
+            aclnn_cast(
+                ctx, acl_src0_f32_tensor.get(), acl_q_tensor.get(), faDataType,
+                [src0, src_dtype, faDataType] {
+                    return ggml_cann_make_cast_trace_event(
+                        src0, src_dtype, faDataType,
+                        ggml_cann_cast_trace::origin::fia,
+                        ggml_cann_cast_tensor_name(src0, "fia_query"),
+                        "FusedInferAttentionScoreV2.q",
+                        ggml_cann_cast_trace::domain::thinker);
+                });
         } else {
             acl_q_tensor = ggml_cann_create_tensor(src0, src0_bsnd_ne, src0_bsnd_nb, GGML_MAX_DIMS);
         }
@@ -4113,7 +4359,17 @@ void ggml_cann_flash_attn_ext(ggml_backend_cann_context & ctx, ggml_tensor * dst
                                         (int64_t) -1, (int64_t) 0, D, (int64_t) 1, sliced_f16_tensor.get());
 
                 acl_tensor_ptr acl_dst_tensor = ggml_cann_create_tensor(dst);
-                aclnn_cast(ctx, sliced_f16_tensor.get(), acl_dst_tensor.get(), ggml_cann_type_mapping(dst->type));
+                const aclDataType dst_dtype = ggml_cann_type_mapping(dst->type);
+                aclnn_cast(
+                    ctx, sliced_f16_tensor.get(), acl_dst_tensor.get(), dst_dtype,
+                    [dst, dst_dtype] {
+                        return ggml_cann_make_cast_trace_event(
+                            dst, ACL_FLOAT16, dst_dtype,
+                            ggml_cann_cast_trace::origin::fia,
+                            "FusedInferAttentionScoreV2.sliced_output",
+                            ggml_cann_cast_tensor_name(dst, "fia_output"),
+                            ggml_cann_cast_trace::domain::thinker);
+                    });
             } else {
                 acl_tensor_ptr acl_dst_tensor = ggml_cann_create_tensor(dst);
                 GGML_CANN_CALL_ACLNN_OP(ctx, Slice, fa_dst_tensor.get(),
@@ -4121,7 +4377,17 @@ void ggml_cann_flash_attn_ext(ggml_backend_cann_context & ctx, ggml_tensor * dst
             }
         } else if (dst->type == GGML_TYPE_F32) {
             acl_tensor_ptr acl_dst_tensor = ggml_cann_create_tensor(dst);
-            aclnn_cast(ctx, fa_dst_tensor.get(), acl_dst_tensor.get(), ggml_cann_type_mapping(dst->type));
+            const aclDataType dst_dtype = ggml_cann_type_mapping(dst->type);
+            aclnn_cast(
+                ctx, fa_dst_tensor.get(), acl_dst_tensor.get(), dst_dtype,
+                [dst, dst_dtype] {
+                    return ggml_cann_make_cast_trace_event(
+                        dst, ACL_FLOAT16, dst_dtype,
+                        ggml_cann_cast_trace::origin::fia,
+                        "FusedInferAttentionScoreV2.output",
+                        ggml_cann_cast_tensor_name(dst, "fia_output"),
+                        ggml_cann_cast_trace::domain::thinker);
+                });
         }
     } else {
         GGML_ABORT("Function is not implemented.");
