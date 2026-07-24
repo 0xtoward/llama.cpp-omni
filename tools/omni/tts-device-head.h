@@ -31,6 +31,10 @@ struct tts_device_head_step {
     std::vector<int32_t> recent_relative_tokens;
     bool skip_repetition = false;
     bool force_no_eos = false;
+    // Required for stochastic mode. Supplying the CPU-generated uniform makes
+    // CPU and device sampling replayable without copying logits to the host.
+    bool has_uniform = false;
+    float uniform = 0.0f;
 };
 
 // Persistent accelerator-side MiniCPMTTS code head.
@@ -59,8 +63,8 @@ public:
             int32_t min_keep,
             float repetition_penalty,
             int32_t repetition_window,
-            uint32_t seed,
             bool greedy,
+            bool apply_top_k_p,
             bool require_cann,
             bool trace,
             std::string & error);

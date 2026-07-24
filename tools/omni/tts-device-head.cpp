@@ -104,6 +104,8 @@ struct tts_device_head::impl {
     ggml_tensor * penalty_pos = nullptr;
     ggml_tensor * eos_bias = nullptr;
     ggml_tensor * eos_id = nullptr;
+    ggml_tensor * uniform = nullptr;
+    ggml_tensor * top_p_floor_bias = nullptr;
     ggml_tensor * sampled = nullptr;
     ggml_tensor * embedding = nullptr;
     ggml_cgraph * graph = nullptr;
@@ -117,6 +119,7 @@ struct tts_device_head::impl {
     int32_t repetition_window = 0;
     float repetition_penalty = 1.0f;
     bool greedy = false;
+    bool apply_top_k_p = false;
     bool trace = false;
 
     ~impl() {
@@ -144,8 +147,8 @@ bool tts_device_head::initialize(
         int32_t min_keep,
         float repetition_penalty,
         int32_t repetition_window,
-        uint32_t seed,
         bool greedy,
+        bool apply_top_k_p,
         bool require_cann,
         bool trace,
         std::string & error) {
@@ -159,6 +162,8 @@ bool tts_device_head::initialize(
     }
     if (hidden_size <= 0 || vocab_size <= 1 || repetition_window <= 0 ||
         repetition_window > vocab_size || top_k < 0 || min_keep < 1 ||
+        (apply_top_k_p &&
+         (top_k < min_keep || top_k > vocab_size || top_p <= 0.0f || top_p > 1.0f)) ||
         hidden.ne[0] != hidden_size || hidden.ne[1] != 1 ||
         hidden.type != GGML_TYPE_F32) {
         error = "invalid TTS head dimensions/sampler contract (requires F32 M=1)";
@@ -180,6 +185,7 @@ bool tts_device_head::initialize(
     pimpl->repetition_penalty = repetition_penalty;
     pimpl->repetition_window = repetition_window;
     pimpl->greedy = greedy;
+    pimpl->apply_top_k_p = apply_top_k_p;
     pimpl->trace = trace;
 
     const size_t weight_meta = 2 * ggml_tensor_overhead();
@@ -217,9 +223,6 @@ bool tts_device_head::initialize(
         llama_sampler_chain_add(pimpl->sampler, llama_sampler_init_greedy());
     } else {
         llama_sampler_chain_add(pimpl->sampler, llama_sampler_init_temp(temperature));
-        llama_sampler_chain_add(pimpl->sampler, llama_sampler_init_top_k(top_k));
-        llama_sampler_chain_add(pimpl->sampler, llama_sampler_init_top_p(top_p, min_keep));
-        llama_sampler_chain_add(pimpl->sampler, llama_sampler_init_dist(seed));
     }
 
     auto * buft = ggml_backend_get_default_buffer_type(backend);
@@ -257,6 +260,11 @@ bool tts_device_head::initialize(
         pimpl->penalty_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, repetition_window);
         pimpl->eos_bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
         pimpl->eos_id = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_set_name(pimpl->recent_ids, "tts_recent_ids");
+        ggml_set_name(pimpl->penalty_neg, "tts_penalty_neg");
+        ggml_set_name(pimpl->penalty_pos, "tts_penalty_pos");
+        ggml_set_name(pimpl->eos_bias, "tts_eos_bias");
+        ggml_set_name(pimpl->eos_id, "tts_eos_id");
         for (auto * input : {
                  pimpl->recent_ids, pimpl->penalty_neg,
                  pimpl->penalty_pos, pimpl->eos_bias, pimpl->eos_id}) {
@@ -291,6 +299,89 @@ bool tts_device_head::initialize(
     };
     pimpl->sampler->iface->backend_apply(
             pimpl->sampler, ctx, pimpl->graph, &sampler_data);
+    if (!greedy) {
+        if (apply_top_k_p) {
+            // Match nucleus_sampling_with_min_keep_tts exactly:
+            // probabilities are normalized over the full vocabulary first,
+            // then the top-k prefix is selected and top-p is evaluated without
+            // renormalizing that prefix.
+            ggml_tensor * full_probs = ggml_soft_max(ctx, sampler_data.logits);
+            ggml_tensor * logits_2d = ggml_reshape_2d(
+                    ctx, sampler_data.logits, 1, vocab_size);
+            ggml_tensor * probs_2d = ggml_reshape_2d(
+                    ctx, full_probs, 1, vocab_size);
+            // ggml_top_k() returns the correct set but does not guarantee
+            // rank order. Sort that compact set explicitly. Avoid
+            // ggml_argsort_top_k(): its full-vocabulary argsort hidden behind
+            // a K-element view can under-allocate on some graph allocators.
+            ggml_tensor * unordered_indices =
+                    ggml_top_k(ctx, sampler_data.logits, top_k);
+            ggml_tensor * unordered_logits = ggml_reshape_1d(
+                    ctx, ggml_get_rows(ctx, logits_2d, unordered_indices), top_k);
+            ggml_tensor * compact_order =
+                    ggml_argsort(ctx, unordered_logits, GGML_SORT_ORDER_DESC);
+            ggml_tensor * top_indices = ggml_reshape_1d(
+                    ctx,
+                    ggml_get_rows(
+                            ctx,
+                            ggml_reshape_2d(ctx, unordered_indices, 1, top_k),
+                            compact_order),
+                    top_k);
+            ggml_tensor * top_logits = ggml_reshape_1d(
+                    ctx, ggml_get_rows(ctx, logits_2d, top_indices), top_k);
+            ggml_tensor * top_probs = ggml_reshape_1d(
+                    ctx, ggml_get_rows(ctx, probs_2d, top_indices), top_k);
+
+            // CPU keeps candidate i when it belongs to min_keep or when the
+            // cumulative probability *before* i is still below top_p.
+            // Express that directly instead of a dynamic set_rows at the
+            // crossing index; the latter is both unnecessary and poorly
+            // supported by device backends.
+            ggml_tensor * cdf_before =
+                    ggml_sub(ctx, ggml_cumsum(ctx, top_probs), top_probs);
+            ggml_tensor * cdf_scaled =
+                    ggml_scale_bias(ctx, cdf_before, -1.0f, top_p);
+            pimpl->top_p_floor_bias =
+                    ggml_new_tensor_1d(ctx, GGML_TYPE_F32, top_k);
+            ggml_set_name(pimpl->top_p_floor_bias, "tts_top_p_floor_bias");
+            ggml_set_input(pimpl->top_p_floor_bias);
+            cdf_scaled = ggml_add(ctx, cdf_scaled, pimpl->top_p_floor_bias);
+            ggml_tensor * keep_mask = ggml_step(ctx, cdf_scaled);
+
+            sampler_data.logits = ggml_add(ctx, top_logits, ggml_log(ctx, keep_mask));
+            sampler_data.candidates = top_indices;
+        }
+
+        // Reproduce the legacy CPU sampler with a caller-provided float
+        // uniform. The large probability/logit tensors never leave device.
+        pimpl->uniform = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        ggml_set_name(pimpl->uniform, "tts_sampling_uniform");
+        ggml_set_input(pimpl->uniform);
+
+        ggml_tensor * probs = ggml_soft_max(ctx, sampler_data.logits);
+        ggml_tensor * cdf = ggml_cumsum(ctx, probs);
+        ggml_tensor * diff = ggml_sub(ctx, cdf, pimpl->uniform);
+        ggml_tensor * mask = ggml_step(ctx, diff);
+        ggml_tensor * count_after = ggml_sum(ctx, mask);
+        const float n_candidates = static_cast<float>(ggml_nelements(mask));
+        ggml_tensor * selected_index = ggml_cast(
+                ctx,
+                ggml_clamp(
+                    ctx,
+                    ggml_scale_bias(ctx, count_after, -1.0f, n_candidates),
+                    0.0f,
+                    n_candidates - 1.0f),
+                GGML_TYPE_I32);
+
+        sampler_data.sampled = selected_index;
+        if (sampler_data.candidates) {
+            ggml_tensor * candidates = ggml_reshape_2d(
+                    ctx, sampler_data.candidates, 1,
+                    ggml_nelements(sampler_data.candidates));
+            sampler_data.sampled = ggml_get_rows(ctx, candidates, selected_index);
+        }
+        ggml_set_name(sampler_data.sampled, "tts_fixed_uniform_sample");
+    }
     pimpl->sampled = sampler_data.sampled;
     if (!pimpl->sampled || pimpl->sampled->type != GGML_TYPE_I32) {
         error = "TTS sampler did not produce an I32 device token";
@@ -305,6 +396,16 @@ bool tts_device_head::initialize(
     ggml_build_forward_expand(pimpl->graph, pimpl->sampled);
     ggml_build_forward_expand(pimpl->graph, pimpl->embedding);
 
+    for (int i = 0; i < ggml_graph_n_nodes(pimpl->graph); ++i) {
+        ggml_tensor * node = ggml_graph_node(pimpl->graph, i);
+        if (!ggml_backend_supports_op(backend, node)) {
+            error = std::string("backend ") + ggml_backend_name(backend) +
+                    " lacks TTS sampler op " + ggml_op_name(node->op);
+            reset();
+            return false;
+        }
+    }
+
     pimpl->allocator = ggml_gallocr_new(buft);
     if (!pimpl->allocator || !ggml_gallocr_alloc_graph(pimpl->allocator, pimpl->graph)) {
         error = "failed to allocate persistent TTS device head graph";
@@ -315,12 +416,24 @@ bool tts_device_head::initialize(
     if (!greedy) {
         const int32_t eos = vocab_size - 1;
         ggml_backend_tensor_set(pimpl->eos_id, &eos, 0, sizeof(eos));
+        if (apply_top_k_p) {
+            std::vector<float> floor_bias(top_k, 0.0f);
+            for (int32_t i = 0; i < min_keep; ++i) {
+                floor_bias[i] = std::numeric_limits<float>::infinity();
+            }
+            ggml_backend_tensor_set(
+                    pimpl->top_p_floor_bias,
+                    floor_bias.data(), 0,
+                    floor_bias.size() * sizeof(floor_bias[0]));
+        }
     }
     LOG_INF("TTS device head: initialized backend=%s hidden=%d vocab=%d sampler=%s "
             "stochastic_exactness=%s\n",
             ggml_backend_name(backend), hidden_size, vocab_size,
-            greedy ? "argmax" : "temp+top-k+top-p+dist",
-            greedy ? "exact" : "unverified");
+            greedy ? "argmax" :
+                (apply_top_k_p ? "temp+top-k+top-p+fixed-uniform" :
+                                 "temp+fixed-uniform"),
+            "exact_replay");
     return true;
 }
 
@@ -343,6 +456,12 @@ bool tts_device_head::forward(
         hidden.type != GGML_TYPE_F32 || hidden.ne[0] != pimpl->hidden_size ||
         hidden.ne[1] != 1) {
         error = "TTS device hidden backend/type/shape changed";
+        return false;
+    }
+    if (!pimpl->greedy &&
+        (!step.has_uniform || !std::isfinite(step.uniform) ||
+         step.uniform < 0.0f || step.uniform >= 1.0f)) {
+        error = "stochastic TTS device head requires a finite uniform in [0,1)";
         return false;
     }
 
@@ -397,10 +516,7 @@ bool tts_device_head::forward(
         ggml_backend_tensor_set(pimpl->penalty_neg, neg.data(), 0, neg.size() * sizeof(neg[0]));
         ggml_backend_tensor_set(pimpl->penalty_pos, pos.data(), 0, pos.size() * sizeof(pos[0]));
         ggml_backend_tensor_set(pimpl->eos_bias, &eos_bias, 0, sizeof(eos_bias));
-    }
-
-    if (pimpl->sampler->iface->backend_set_input) {
-        pimpl->sampler->iface->backend_set_input(pimpl->sampler);
+        ggml_backend_tensor_set(pimpl->uniform, &step.uniform, 0, sizeof(step.uniform));
     }
 
     const auto start = std::chrono::steady_clock::now();

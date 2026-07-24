@@ -2949,7 +2949,8 @@ static llama_token sample_tts_token_device(
         bool skip_processors,
         bool force_no_eos,
         bool skip_eos_prefill,
-        int repetition_window) {
+        int repetition_window,
+        bool apply_top_k_p) {
     constexpr llama_token audio_bos_token_id = 151687;
     constexpr int32_t num_audio_tokens = 6562;
 
@@ -2958,16 +2959,7 @@ static llama_token sample_tts_token_device(
         return 0;
     }
 
-    // The first production cut is deliberately deterministic.  The backend
-    // supports seeded dist/top-k/top-p graphs, but the legacy CPU simplex and
-    // duplex paths have different first-code warper semantics.  Do not claim
-    // stochastic equivalence until fixed-uniform replay covers both policies.
     const bool greedy = params->sampling.temp <= 0.0f;
-    if (!greedy) {
-        LOG_ERR("%s: OMNI_TTS_HEAD=cann currently requires --temp 0; "
-                "stochastic CPU/NPU policy parity is not verified\n", __func__);
-        return 0;
-    }
 
     llama_device_tensor hidden = {};
     if (!llama_get_embeddings_device_ith(ctx_omni->ctx_tts_llama, -1, &hidden)) {
@@ -2998,8 +2990,8 @@ static llama_token sample_tts_token_device(
                     /*min_keep=*/3,
                     /*repetition_penalty=*/1.05f,
                     repetition_window,
-                    params->sampling.seed,
-                    /*greedy=*/true,
+                    greedy,
+                    apply_top_k_p,
                     /*require_cann=*/true,
                     ctx_omni->tts_device_head_trace,
                     error)) {
@@ -3016,11 +3008,8 @@ static llama_token sample_tts_token_device(
     }
 
     omni::tts_device_head_step step;
-    // Greedy CPU behavior does not apply repetition or EOS masking.  Preserve
-    // that exact contract even when the caller supplied those stochastic-only
-    // policy flags.
-    step.skip_repetition = true;
-    step.force_no_eos = false;
+    step.skip_repetition = greedy || skip_processors;
+    step.force_no_eos = !greedy && force_no_eos;
     if (tokens_for_penalty) {
         step.recent_relative_tokens.reserve(tokens_for_penalty->size());
         for (llama_token token : *tokens_for_penalty) {
@@ -3030,8 +3019,16 @@ static llama_token sample_tts_token_device(
             }
         }
     }
-    GGML_UNUSED(skip_processors);
-    GGML_UNUSED(force_no_eos);
+    if (!greedy) {
+        std::mt19937 * rng = get_sampler_rng(smpl);
+        if (!rng) {
+            LOG_ERR("%s: stochastic device sampling requires the common sampler RNG\n", __func__);
+            return 0;
+        }
+        std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+        step.uniform = dist(*rng);
+        step.has_uniform = true;
+    }
 
     int32_t relative = -1;
     llama_device_tensor selected_embedding = {};
@@ -3111,7 +3108,8 @@ static llama_token sample_tts_token_simplex(struct common_sampler * smpl, struct
                 /*skip_processors=*/is_audio_bos,
                 force_no_eos,
                 /*skip_eos_prefill=*/!is_final_text_chunk,
-                /*repetition_window=*/8);
+                /*repetition_window=*/8,
+                /*apply_top_k_p=*/false);
     }
     
     // 使用 head_code 层计算 audio logits
@@ -3388,7 +3386,8 @@ llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context *
                 force_no_eos,
                 /*skip_eos_prefill=*/
                     ctx_omni->duplex_mode && !is_final_text_chunk,
-                /*repetition_window=*/16);
+                /*repetition_window=*/16,
+                /*apply_top_k_p=*/true);
     }
     
     // 1. 获取TTS模型的最后一个位置的hidden state
