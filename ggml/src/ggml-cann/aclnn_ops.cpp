@@ -693,8 +693,15 @@ void ggml_cann_argsort(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     acl_tensor_ptr       acl_dst = ggml_cann_create_tensor(dst);
     ggml_cann_pool_alloc temp_buffer_allocator(ctx.pool(), ggml_nelements(dst) * sizeof(int64_t));
     void *               buffer = temp_buffer_allocator.get();
+    size_t               tmp_nb[GGML_MAX_DIMS];
+    tmp_nb[0] = sizeof(int64_t);
+    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+        tmp_nb[i] = tmp_nb[i - 1] * static_cast<size_t>(dst->ne[i - 1]);
+    }
     acl_tensor_ptr       tmp_tensor =
-        ggml_cann_create_tensor(buffer, ACL_INT64, ggml_type_size(dst->type), dst->ne, dst->nb, GGML_MAX_DIMS);
+        ggml_cann_create_tensor(
+            buffer, ACL_INT64, sizeof(int64_t), dst->ne, tmp_nb,
+            GGML_MAX_DIMS);
     GGML_CANN_CALL_ACLNN_OP(ctx, Argsort, acl_src.get(), -1, (order == GGML_SORT_ORDER_DESC ? true : false),
                             tmp_tensor.get());
     GGML_CANN_CALL_ACLNN_OP(ctx, Cast, tmp_tensor.get(), ggml_cann_type_mapping(dst->type), acl_dst.get());
