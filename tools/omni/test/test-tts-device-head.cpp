@@ -3,6 +3,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
 #include "src/llama-graph.h"
+#include "src/llama-device-tensor-fence.h"
 
 #include <algorithm>
 #include <cassert>
@@ -69,6 +70,32 @@ static void assert_production_transfer_contract(
 static void test_config() {
     omni::tts_device_head_config config;
     std::string error;
+
+    const auto fence_default =
+            llama_parse_device_tensor_fence_config(nullptr);
+    assert(fence_default);
+    assert(fence_default.mode ==
+           llama_device_tensor_fence_mode::sync);
+    const auto fence_sync =
+            llama_parse_device_tensor_fence_config("sync");
+    assert(fence_sync);
+    assert(fence_sync.mode ==
+           llama_device_tensor_fence_mode::sync);
+    const auto fence_event_sync =
+            llama_parse_device_tensor_fence_config("event_sync");
+    assert(fence_event_sync);
+    assert(fence_event_sync.mode ==
+           llama_device_tensor_fence_mode::event_sync);
+    const auto fence_stream_wait =
+            llama_parse_device_tensor_fence_config("stream_wait");
+    assert(fence_stream_wait);
+    assert(fence_stream_wait.mode ==
+           llama_device_tensor_fence_mode::stream_wait);
+    const auto fence_invalid =
+            llama_parse_device_tensor_fence_config("event");
+    assert(!fence_invalid);
+    assert(fence_invalid.error ==
+           "OMNI_TTS_HIDDEN_FENCE must be sync|event_sync|stream_wait");
 
     assert(omni::tts_device_head_parse_config(
             nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, config, error));

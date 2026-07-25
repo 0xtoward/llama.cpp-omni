@@ -41,6 +41,13 @@ llama_context::llama_context(
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
 
+    embeddings_device_fence =
+            llama_parse_device_tensor_fence_config(
+                    std::getenv("OMNI_TTS_HIDDEN_FENCE"));
+    if (!embeddings_device_fence) {
+        throw std::runtime_error(embeddings_device_fence.error);
+    }
+
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
 
@@ -905,6 +912,12 @@ bool llama_context::get_embeddings_device_ith(int32_t i, llama_device_tensor * o
     *out = {};
 
     try {
+        if (embeddings_device_fence.mode ==
+            llama_device_tensor_fence_mode::sync) {
+            // Correctness oracle and production default. This preserves the
+            // b9909fd behavior while event-based modes are qualified on CANN.
+            synchronize();
+        }
         if (!embeddings_device_only || !cparams.embeddings) {
             throw std::runtime_error("device-only embeddings are not enabled");
         }
@@ -918,26 +931,29 @@ bool llama_context::get_embeddings_device_ith(int32_t i, llama_device_tensor * o
         if (!backend) {
             throw std::runtime_error("embedding tensor has no execution backend");
         }
-        auto * device = ggml_backend_get_device(backend);
-        ggml_backend_dev_props props = {};
-        ggml_backend_dev_get_props(device, &props);
-        if (!props.caps.events) {
-            throw std::runtime_error(
-                    format("embedding backend %s does not support producer events",
-                           ggml_backend_name(backend)));
-        }
-        if (!embeddings_device_ready_event ||
-            embeddings_device_ready_backend != backend) {
-            embeddings_device_ready_event.reset();
-            embeddings_device_ready_backend = nullptr;
-            embeddings_device_ready_event.reset(
-                    ggml_backend_event_new(device));
-            if (!embeddings_device_ready_event) {
+        if (embeddings_device_fence.mode !=
+            llama_device_tensor_fence_mode::sync) {
+            auto * device = ggml_backend_get_device(backend);
+            ggml_backend_dev_props props = {};
+            ggml_backend_dev_get_props(device, &props);
+            if (!props.caps.events) {
                 throw std::runtime_error(
-                        format("embedding backend %s failed to create a producer event",
+                        format("embedding backend %s does not support producer events",
                                ggml_backend_name(backend)));
             }
-            embeddings_device_ready_backend = backend;
+            if (!embeddings_device_ready_event ||
+                embeddings_device_ready_backend != backend) {
+                embeddings_device_ready_event.reset();
+                embeddings_device_ready_backend = nullptr;
+                embeddings_device_ready_event.reset(
+                        ggml_backend_event_new(device));
+                if (!embeddings_device_ready_event) {
+                    throw std::runtime_error(
+                            format("embedding backend %s failed to create a producer event",
+                                   ggml_backend_name(backend)));
+                }
+                embeddings_device_ready_backend = backend;
+            }
         }
 
         // The TTS prefill commonly produces multiple output rows, while its
@@ -980,11 +996,23 @@ bool llama_context::get_embeddings_device_ith(int32_t i, llama_device_tensor * o
 
         out->tensor  = &embeddings_device_row_view;
         out->backend = backend;
-        // Record after the asynchronously submitted producer graph. The
-        // consumer enqueues its stream wait before touching this borrowed row.
-        ggml_backend_event_record(
-                embeddings_device_ready_event.get(), backend);
-        out->ready_event = embeddings_device_ready_event.get();
+        if (embeddings_device_fence.mode !=
+            llama_device_tensor_fence_mode::sync) {
+            // Diagnostic event modes deliberately share the same record point.
+            // event_sync proves whether this backend/event sees the real
+            // producer work; stream_wait additionally tests device-side wait
+            // and event reuse without a Host barrier.
+            ggml_backend_event_record(
+                    embeddings_device_ready_event.get(), backend);
+            if (embeddings_device_fence.mode ==
+                llama_device_tensor_fence_mode::event_sync) {
+                ggml_backend_event_synchronize(
+                        embeddings_device_ready_event.get());
+            } else {
+                out->ready_event =
+                        embeddings_device_ready_event.get();
+            }
+        }
         out->type    = static_cast<int32_t>(embeddings_device_row_view.type);
         for (int d = 0; d < 4; ++d) {
             out->ne[d] = embeddings_device_row_view.ne[d];

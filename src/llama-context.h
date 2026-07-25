@@ -5,6 +5,7 @@
 #include "llama-cparams.h"
 #include "llama-graph.h"
 #include "llama-adapter.h"
+#include "llama-device-tensor-fence.h"
 #include "llama-impl.h"
 
 #include "ggml-cpp.h"
@@ -364,6 +365,7 @@ private:
     // Reset explicitly in the destructor while its backend device is alive.
     ggml_backend_event_ptr embeddings_device_ready_event;
     ggml_backend_t         embeddings_device_ready_backend = nullptr;
+    llama_device_tensor_fence_config embeddings_device_fence;
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;
