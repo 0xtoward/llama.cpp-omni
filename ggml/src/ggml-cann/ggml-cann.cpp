@@ -25,6 +25,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-cann/aclnn_ops.h"
 #include "ggml-cann/common.h"
+#include "ggml-cann/memcpy-trace.h"
 #include "ggml-impl.h"
 #include "ggml.h"
 
@@ -1292,7 +1293,9 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
 
     // Plain tensor (not quantized, not NZ): direct copy, no tracking needed
     if (!is_quantized && !is_nz) {
-        ACL_CHECK(aclrtMemcpy((char *) tensor->data + offset, size, data, size, ACL_MEMCPY_HOST_TO_DEVICE));
+        ACL_CHECK(ggml_cann_memcpy_sync_traced(
+            (char *) tensor->data + offset, size, data, size,
+            ACL_MEMCPY_HOST_TO_DEVICE, tensor, "buffer_set", ctx->device));
         return;
     }
 
@@ -1301,13 +1304,17 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
         if (is_quantized) {
             void * transform_buffer = malloc(size);
             ggml_backend_cann_transform(tensor, data, transform_buffer);
-            ACL_CHECK(aclrtMemcpy(tensor->data, size, transform_buffer, size, ACL_MEMCPY_HOST_TO_DEVICE));
+            ACL_CHECK(ggml_cann_memcpy_sync_traced(
+                tensor->data, size, transform_buffer, size,
+                ACL_MEMCPY_HOST_TO_DEVICE, tensor, "buffer_set_transform", ctx->device));
             free(transform_buffer);
         } else {
             // NZ weight
             GGML_ASSERT(tensor->ne[2] == 1);
             GGML_ASSERT(tensor->ne[3] == 1);
-            ACL_CHECK(aclrtMemcpy(tensor->data, size, data, size, ACL_MEMCPY_HOST_TO_DEVICE));
+            ACL_CHECK(ggml_cann_memcpy_sync_traced(
+                tensor->data, size, data, size,
+                ACL_MEMCPY_HOST_TO_DEVICE, tensor, "buffer_set_weight", ctx->device));
             weight_format_to_nz(tensor, ctx->device);
         }
         return;
@@ -1325,7 +1332,9 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
         memcpy(tracker->host_buffer.data() + offset, data, size);
     } else {
         // NZ weight: upload chunk to device immediately, defer conversion
-        ACL_CHECK(aclrtMemcpy((char *) tensor->data + offset, size, data, size, ACL_MEMCPY_HOST_TO_DEVICE));
+        ACL_CHECK(ggml_cann_memcpy_sync_traced(
+            (char *) tensor->data + offset, size, data, size,
+            ACL_MEMCPY_HOST_TO_DEVICE, tensor, "buffer_set_weight_chunk", ctx->device));
     }
 
     tracker->bytes_written += size;
@@ -1335,7 +1344,9 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
         if (is_quantized) {
             void * transform_buffer = malloc(tracker->total_bytes);
             ggml_backend_cann_transform(tensor, tracker->host_buffer.data(), transform_buffer);
-            ACL_CHECK(aclrtMemcpy(tensor->data, tracker->total_bytes, transform_buffer, tracker->total_bytes, ACL_MEMCPY_HOST_TO_DEVICE));
+            ACL_CHECK(ggml_cann_memcpy_sync_traced(
+                tensor->data, tracker->total_bytes, transform_buffer, tracker->total_bytes,
+                ACL_MEMCPY_HOST_TO_DEVICE, tensor, "buffer_set_transform", ctx->device));
             free(transform_buffer);
         }
 
@@ -1374,10 +1385,14 @@ static void ggml_backend_cann_buffer_get_tensor(ggml_backend_buffer_t buffer,
     ggml_cann_set_device(ctx->device);
 
     if (!need_transform(tensor->type)) {
-        ACL_CHECK(aclrtMemcpy(data, size, (char *) tensor->data + offset, size, ACL_MEMCPY_DEVICE_TO_HOST));
+        ACL_CHECK(ggml_cann_memcpy_sync_traced(
+            data, size, (char *) tensor->data + offset, size,
+            ACL_MEMCPY_DEVICE_TO_HOST, tensor, "buffer_get", ctx->device));
     } else {
         void * transform_buffer = malloc(size);
-        ACL_CHECK(aclrtMemcpy(transform_buffer, size, (char *) tensor->data + offset, size, ACL_MEMCPY_DEVICE_TO_HOST));
+        ACL_CHECK(ggml_cann_memcpy_sync_traced(
+            transform_buffer, size, (char *) tensor->data + offset, size,
+            ACL_MEMCPY_DEVICE_TO_HOST, tensor, "buffer_get_transform", ctx->device));
         ggml_backend_cann_transform_back(tensor, transform_buffer, data);
         free(transform_buffer);
     }
@@ -1406,8 +1421,9 @@ static bool ggml_backend_cann_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
         size_t memcpy_size = ggml_nbytes(src);
         // Same device.
         if (src_ctx->device == dst_ctx->device) {
-            ACL_CHECK(aclrtMemcpy((char *) dst->data, memcpy_size, (const char *) src->data, memcpy_size,
-                                  ACL_MEMCPY_DEVICE_TO_DEVICE));
+            ACL_CHECK(ggml_cann_memcpy_sync_traced(
+                (char *) dst->data, memcpy_size, (const char *) src->data, memcpy_size,
+                ACL_MEMCPY_DEVICE_TO_DEVICE, dst, "buffer_copy_same_device", dst_ctx->device));
             return true;
         } else {
 #ifdef ASCEND_310P
@@ -1420,8 +1436,9 @@ static bool ggml_backend_cann_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
             if (canAccessPeer) {
                 ggml_cann_set_device(src_ctx->device);
                 ACL_CHECK(aclrtDeviceEnablePeerAccess(dst_ctx->device, 0));
-                ACL_CHECK(aclrtMemcpy((char *) dst->data, memcpy_size, (const char *) src->data, memcpy_size,
-                                      ACL_MEMCPY_DEVICE_TO_DEVICE));
+                ACL_CHECK(ggml_cann_memcpy_sync_traced(
+                    (char *) dst->data, memcpy_size, (const char *) src->data, memcpy_size,
+                    ACL_MEMCPY_DEVICE_TO_DEVICE, dst, "buffer_copy_peer", dst_ctx->device));
                 return true;
             }
         }
@@ -2102,8 +2119,10 @@ static void ggml_backend_cann_set_tensor_async(ggml_backend_t backend,
     // token2wav thread) may reach here as their first CANN call, and
     // aclrtMemcpyAsync requires a thread-local ACL context.
     ggml_cann_set_device(cann_ctx->device);
-    ACL_CHECK(aclrtMemcpyAsync((char *) tensor->data + offset, size, data, size, ACL_MEMCPY_HOST_TO_DEVICE,
-                               cann_ctx->stream()));
+    ACL_CHECK(ggml_cann_memcpy_async_traced(
+        (char *) tensor->data + offset, size, data, size,
+        ACL_MEMCPY_HOST_TO_DEVICE, cann_ctx->stream(), tensor,
+        "backend_set_async", cann_ctx->device));
 }
 
 /**
@@ -2130,8 +2149,10 @@ static void ggml_backend_cann_get_tensor_async(ggml_backend_t      backend,
 
     // Same as set_tensor_async: ensure this thread has an ACL context.
     ggml_cann_set_device(cann_ctx->device);
-    ACL_CHECK(aclrtMemcpyAsync(data, size, (char *) tensor->data + offset, size, ACL_MEMCPY_DEVICE_TO_HOST,
-                               cann_ctx->stream()));
+    ACL_CHECK(ggml_cann_memcpy_async_traced(
+        data, size, (char *) tensor->data + offset, size,
+        ACL_MEMCPY_DEVICE_TO_HOST, cann_ctx->stream(), tensor,
+        "backend_get_async", cann_ctx->device));
 }
 
 /**
@@ -2192,8 +2213,10 @@ static bool ggml_backend_cann_cpy_tensor_async(ggml_backend_t      backend_src,
         ACL_CHECK(aclrtDeviceEnablePeerAccess(cann_ctx_dst->device, 0));
 
         // wait for task_queue empty to keep task order.
-        ACL_CHECK(aclrtMemcpyAsync(dst->data, copy_size, src->data, copy_size, ACL_MEMCPY_DEVICE_TO_DEVICE,
-                                   cann_ctx_src->stream()));
+        ACL_CHECK(ggml_cann_memcpy_async_traced(
+            dst->data, copy_size, src->data, copy_size,
+            ACL_MEMCPY_DEVICE_TO_DEVICE, cann_ctx_src->stream(), dst,
+            "backend_copy_async_peer", cann_ctx_dst->device));
         // record event on src stream after the copy
         // TODO: this event is not effective with acl graph mode, change to use aclrtSynchronizeStream
         // if (!cann_ctx_src->copy_event) {
@@ -2207,8 +2230,10 @@ static bool ggml_backend_cann_cpy_tensor_async(ggml_backend_t      backend_src,
         ACL_CHECK(aclrtSynchronizeStream(cann_ctx_src->stream()));
     } else {
         // src and dst are on the same backend
-        ACL_CHECK(aclrtMemcpyAsync(dst->data, copy_size, src->data, copy_size, ACL_MEMCPY_DEVICE_TO_DEVICE,
-                                   cann_ctx_dst->stream()));
+        ACL_CHECK(ggml_cann_memcpy_async_traced(
+            dst->data, copy_size, src->data, copy_size,
+            ACL_MEMCPY_DEVICE_TO_DEVICE, cann_ctx_dst->stream(), dst,
+            "backend_copy_async_same_device", cann_ctx_dst->device));
     }
 
     return true;

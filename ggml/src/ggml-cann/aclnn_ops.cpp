@@ -22,6 +22,7 @@
 
 #include "aclnn_ops.h"
 #include "cast-trace.h"
+#include "memcpy-trace.h"
 
 #include "ggml-impl.h"
 #include "ggml.h"
@@ -874,8 +875,9 @@ void ggml_cann_set(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     if (!inplace) {
         // First copy src0 to dst entirely
         size_t cpy_size = ggml_nbytes(dst);
-        ACL_CHECK(
-            aclrtMemcpyAsync(dst->data, cpy_size, src0->data, cpy_size, ACL_MEMCPY_DEVICE_TO_DEVICE, ctx.stream()));
+        ACL_CHECK(ggml_cann_memcpy_async_traced(
+            dst->data, cpy_size, src0->data, cpy_size,
+            ACL_MEMCPY_DEVICE_TO_DEVICE, ctx.stream(), dst, "op_set_copy", ctx.device));
     }
 
     // Copy src1 into the target region of dst
@@ -903,8 +905,9 @@ void ggml_cann_acc(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
 
     if (!inplace) {
         size_t cpy_size = ggml_nbytes(dst);
-        ACL_CHECK(
-            aclrtMemcpyAsync(dst->data, cpy_size, src0->data, cpy_size, ACL_MEMCPY_DEVICE_TO_DEVICE, ctx.stream()));
+        ACL_CHECK(ggml_cann_memcpy_async_traced(
+            dst->data, cpy_size, src0->data, cpy_size,
+            ACL_MEMCPY_DEVICE_TO_DEVICE, ctx.stream(), dst, "op_acc_copy", ctx.device));
         acl_tensor_ptr acl_src0 =
             ggml_cann_create_tensor(src0, src1->ne, src0->nb, GGML_MAX_DIMS, ACL_FORMAT_ND, offset);
 
@@ -1625,16 +1628,18 @@ static void ggml_cann_im2col_1d_post_process(ggml_backend_cann_context &  ctx,
             cur_dst_buffer     = (char *) dst->data + c * KH * KW * n_step_w * ggml_type_size(dst->type);
 
             for (int i = 0; i < n_step_w; i++) {
-                ACL_CHECK(aclrtMemcpyAsync(cur_dst_buffer, cpy_size, cur_permute_buffer, cpy_size,
-                                           ACL_MEMCPY_DEVICE_TO_DEVICE, ctx.stream()));
+                ACL_CHECK(ggml_cann_memcpy_async_traced(
+                    cur_dst_buffer, cpy_size, cur_permute_buffer, cpy_size,
+                    ACL_MEMCPY_DEVICE_TO_DEVICE, ctx.stream(), dst, "op_im2col_relayout", ctx.device));
                 cur_dst_buffer     = (char *) cur_dst_buffer + KH * KW * ggml_type_size(dst->type);
                 cur_permute_buffer = (char *) cur_permute_buffer + KH * KW * IC * ggml_type_size(dst->type);
             }
         }
     } else {
         offset = KH * KW * n_step_w * ggml_type_size(dst->type);  // equal to ggml_nbytes(dst)
-        ACL_CHECK(aclrtMemcpyAsync(dst->data, offset, (char *) tmp_permute_buffer + offset, offset,
-                                   ACL_MEMCPY_DEVICE_TO_DEVICE, ctx.stream()));
+        ACL_CHECK(ggml_cann_memcpy_async_traced(
+            dst->data, offset, (char *) tmp_permute_buffer + offset, offset,
+            ACL_MEMCPY_DEVICE_TO_DEVICE, ctx.stream(), dst, "op_im2col_relayout", ctx.device));
     }
 }
 
@@ -2802,9 +2807,10 @@ static void aclnn_rope_cache_init(ggml_backend_cann_context & ctx,
         ACL_CHECK(aclrtMalloc(&ctx.rope_cache.theta_scale_cache, theta_scale_length * sizeof(float),
                               ACL_MEM_MALLOC_HUGE_FIRST));
 
-        ACL_CHECK(aclrtMemcpyAsync(ctx.rope_cache.theta_scale_cache, theta_scale_length * sizeof(float),
-                                   ctx.rope_cache.theta_scale_exp_host, theta_scale_length * sizeof(float),
-                                   ACL_MEMCPY_HOST_TO_DEVICE, ctx.stream()));
+        ACL_CHECK(ggml_cann_memcpy_async_traced(
+            ctx.rope_cache.theta_scale_cache, theta_scale_length * sizeof(float),
+            ctx.rope_cache.theta_scale_exp_host, theta_scale_length * sizeof(float),
+            ACL_MEMCPY_HOST_TO_DEVICE, ctx.stream(), dst, "op_rope_cache_init", ctx.device));
     }
     acl_theta_scale_tensor = ggml_cann_create_tensor(ctx.rope_cache.theta_scale_cache, ACL_FLOAT, sizeof(float),
                                                      theta_scale_ne, theta_scale_nb, 1);
@@ -2925,9 +2931,10 @@ static void aclnn_rope_cache_init(ggml_backend_cann_context & ctx,
             ACL_CHECK(aclrtMalloc(&ctx.rope_cache.position_select_index, theta_scale_length * sizeof(int),
                                   ACL_MEM_MALLOC_HUGE_FIRST));
 
-            ACL_CHECK(aclrtMemcpyAsync(ctx.rope_cache.position_select_index, theta_scale_length * sizeof(int),
-                                       ctx.rope_cache.position_select_index_host, theta_scale_length * sizeof(int),
-                                       ACL_MEMCPY_HOST_TO_DEVICE, ctx.stream()));
+            ACL_CHECK(ggml_cann_memcpy_async_traced(
+                ctx.rope_cache.position_select_index, theta_scale_length * sizeof(int),
+                ctx.rope_cache.position_select_index_host, theta_scale_length * sizeof(int),
+                ACL_MEMCPY_HOST_TO_DEVICE, ctx.stream(), dst, "op_rope_cache_init", ctx.device));
         }
 
         position_select_index_tensor = ggml_cann_create_tensor(ctx.rope_cache.position_select_index, ACL_INT32,
