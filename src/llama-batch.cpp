@@ -60,6 +60,15 @@ bool llama_batch_allocr::init(
                     device_embd->ne[0], device_embd->ne[1], n_embd);
             return false;
         }
+        const ggml_backend_buffer_type_t buft =
+                ggml_backend_buffer_get_type(device_embd->buffer);
+        if (!buft || ggml_backend_buft_is_host(buft) ||
+            !ggml_backend_buft_get_device(buft)) {
+            LLAMA_LOG_ERROR(
+                    "%s: embd_device must reside in a non-host device buffer, got %s\n",
+                    __func__, buft ? ggml_backend_buft_name(buft) : "(null)");
+            return false;
+        }
     }
 
     if (n_seq_max > LLAMA_MAX_SEQ) {

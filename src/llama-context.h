@@ -258,6 +258,11 @@ private:
 
     llm_graph_cb graph_get_cb() const;
 
+    // Resolve an accelerator-resident embedding input to the exact backend
+    // that owns its buffer. Returns nullptr when the tensor is on host or its
+    // device is not part of this context.
+    ggml_backend_t get_device_embedding_backend(const ggml_tensor * tensor) const;
+
     // TODO: read/write lora adapters and cvec
     size_t state_write_data(llama_io_write_i & io);
     size_t state_read_data (llama_io_read_i  & io);

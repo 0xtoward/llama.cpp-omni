@@ -631,6 +631,13 @@ struct llm_graph_params {
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
+        const auto embd_device_buft = [](const llama_ubatch & batch) {
+            if (!batch.embd_device || !batch.embd_device->buffer) {
+                return (ggml_backend_buffer_type_t) nullptr;
+            }
+            return ggml_backend_buffer_get_type(batch.embd_device->buffer);
+        };
+
         // first check the ubatch
         bool can_reuse_ubatch =
             ubatch.equal_seqs() == other.ubatch.equal_seqs() &&
@@ -638,6 +645,11 @@ struct llm_graph_params {
             ubatch.n_seq_tokens == other.ubatch.n_seq_tokens &&
             ubatch.n_seqs       == other.ubatch.n_seqs &&
             ubatch.n_seqs_unq   == other.ubatch.n_seqs_unq &&
+            // Host embeddings and device embeddings have the same graph
+            // topology, but their graph inputs must be allocated on different
+            // backends. Device embeddings from different accelerators likewise
+            // cannot reuse the same allocation.
+            embd_device_buft(ubatch) == embd_device_buft(other.ubatch) &&
             (
                 (!ubatch.token && !other.ubatch.token) ||
                 ((!ubatch.embd && !ubatch.embd_device) &&

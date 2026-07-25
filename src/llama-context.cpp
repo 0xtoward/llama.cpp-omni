@@ -1395,6 +1395,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    if (ubatch.embd_device &&
+        !get_device_embedding_backend(ubatch.embd_device)) {
+        LLAMA_LOG_ERROR(
+                "%s: device embedding buffer '%s' is not visible to this context; refusing host fallback\n",
+                __func__,
+                ubatch.embd_device->buffer
+                    ? ggml_backend_buffer_name(ubatch.embd_device->buffer)
+                    : "(null)");
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
+
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
 
@@ -2485,6 +2497,20 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_set_name(cur, name);
         }
 
+        // Graph inputs normally default to the final scheduler backend (CPU).
+        // When Omni feeds an accelerator-resident sampled embedding back into
+        // MiniCPMTTS, allocate inp_embd on the source tensor's exact device so
+        // set_input performs a true same-device copy instead of staging 3072
+        // bytes through host on every audio code.
+        if (ubatch.embd_device && il == -1 &&
+            strcmp(name, "inp_embd") == 0) {
+            ggml_backend_t backend =
+                    get_device_embedding_backend(ubatch.embd_device);
+            GGML_ASSERT(backend &&
+                    "device embedding backend was validated before graph build");
+            ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend);
+        }
+
         // norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
         // FIXME: fix in ggml_backend_sched
         const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer;
@@ -2501,6 +2527,33 @@ llm_graph_cb llama_context::graph_get_cb() const {
             }
         }
     };
+}
+
+ggml_backend_t llama_context::get_device_embedding_backend(
+        const ggml_tensor * tensor) const {
+    if (!tensor || !tensor->buffer) {
+        return nullptr;
+    }
+
+    ggml_backend_buffer_type_t buft =
+            ggml_backend_buffer_get_type(tensor->buffer);
+    if (!buft || ggml_backend_buft_is_host(buft)) {
+        return nullptr;
+    }
+
+    ggml_backend_dev_t device = ggml_backend_buft_get_device(buft);
+    if (!device) {
+        return nullptr;
+    }
+
+    for (const auto & backend : backends) {
+        if (ggml_backend_get_device(backend.get()) == device &&
+            ggml_backend_supports_buft(backend.get(), buft)) {
+            return backend.get();
+        }
+    }
+
+    return nullptr;
 }
 
 //
