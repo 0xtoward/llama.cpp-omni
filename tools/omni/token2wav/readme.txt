@@ -40,3 +40,25 @@ reset()
   首次做 kernel 级 profile 时可配合：
     nsys profile --trace=cuda,nvtx,osrt -o t2w \
         env OMNI_T2W_PROFILE=2 OMNI_T2W_PRINT_GRAPH=1 ./token2wav-example
+
+5. Ascend exact-shape Graph 与 HiFT 预热
+  Token2Mel 的 nonlast / last 图仅在 setup_cache 或
+  init_from_host_caches 中 warmup + capture；请求热路径只允许命中已有图，
+  miss 时走 eager，不允许现场 capture：
+
+    GGML_CANN_GRAPH_EXPERIMENT=stage_exact
+    GGML_CANN_GRAPH_STAGES=token2mel,hift
+
+  HiFT 的 first / steady 精确图可在模型 ready 前预建：
+
+    OMNI_HIFT_RUNNER=persistent_graph
+    OMNI_HIFT_PREWARM=first_steady
+    OMNI_HIFT_PLAN_CACHE_CAPACITY=6
+
+  该模式固定 first={T_mel=50,Tc=0}、steady={T_mel=58,Tc=3840}。
+  不匹配的 first / steady 请求会直接报错；final 的 T_mel 为动态形状，
+  只建立 persistent eager plan，绝不在请求热路径 capture。
+
+  OMNI_HIFT_PREWARM 的合法值只有 off / first_steady。first_steady 要求
+  persistent_graph、hift stage_exact 域和至少 3 个 plan cache slot；
+  任一条件不满足都会在启动时 fail closed。

@@ -6758,6 +6758,7 @@ struct voc_hg2_runner::persistent_state {
         int64_t                 source_tail_len = 0;
         uint64_t                last_use = 0;
         uint64_t                execution_count = 0;
+        bool                    prewarmed = false;
 
         bool upload_constants(voc_hg2_model * model) const {
             if (!model || !model->hg2) {
@@ -6822,7 +6823,219 @@ struct voc_hg2_runner::persistent_state {
     int64_t  active_source_len = 0;
     uint64_t clock = 0;
     uint64_t session_epoch = 0;
+
+    plan * get_or_create_plan(
+        voc_hg2_runner & runner,
+        const key &      cache_key,
+        bool &           cache_hit);
 };
+
+voc_hg2_runner::persistent_state::plan *
+voc_hg2_runner::persistent_state::get_or_create_plan(
+        voc_hg2_runner & runner,
+        const key &      cache_key,
+        bool &           cache_hit) {
+    cache_hit = false;
+    auto found = plans.find(cache_key);
+    if (found != plans.end()) {
+        cache_hit = true;
+        return found->second.get();
+    }
+    if (!runner.model || !runner.model->backend || !runner.model->hg2) {
+        return nullptr;
+    }
+
+    constexpr int64_t kPersistentSourceCacheLen =
+        8 * hifigan2::hg2_hift_generator::HG2_SAMPLES_PER_MEL;
+    constexpr int64_t kChannels = 80;
+    constexpr int64_t kBatch = 1;
+
+    auto plan_value = std::make_unique<plan>();
+    plan_value->cache_key = cache_key;
+
+    ggml_init_params input_params{};
+    input_params.mem_size   = 16 * ggml_tensor_overhead();
+    input_params.mem_buffer = nullptr;
+    input_params.no_alloc   = true;
+    plan_value->input_ctx = ggml_init(input_params);
+    if (!plan_value->input_ctx) {
+        std::fprintf(stderr, "voc_hg2_runner: failed to create persistent HiFT input context\n");
+        return nullptr;
+    }
+
+    plan_value->speech_upload_tcb =
+        ggml_new_tensor_3d(
+            plan_value->input_ctx,
+            GGML_TYPE_F32,
+            cache_key.t_mel,
+            kChannels,
+            kBatch);
+    plan_value->cache_source_t1_b =
+        ggml_new_tensor_3d(
+            plan_value->input_ctx,
+            GGML_TYPE_F32,
+            cache_key.tc,
+            1,
+            kBatch);
+    ggml_set_input(plan_value->speech_upload_tcb);
+    ggml_set_input(plan_value->cache_source_t1_b);
+    if (cache_key.tc > 0) {
+        plan_value->cache_source_flat =
+            ggml_view_1d(
+                plan_value->input_ctx,
+                plan_value->cache_source_t1_b,
+                cache_key.tc,
+                0);
+    }
+    plan_value->input_buffer =
+        ggml_backend_alloc_ctx_tensors(
+            plan_value->input_ctx,
+            runner.model->backend);
+    if (!plan_value->input_buffer) {
+        std::fprintf(stderr, "voc_hg2_runner: failed to allocate persistent HiFT inputs\n");
+        return nullptr;
+    }
+
+    ggml_init_params compute_params{};
+    compute_params.mem_size   = 2048ull * 1024ull * 1024ull;
+    compute_params.mem_buffer = nullptr;
+    compute_params.no_alloc   = true;
+    plan_value->compute_ctx = ggml_init(compute_params);
+    if (!plan_value->compute_ctx) {
+        std::fprintf(stderr, "voc_hg2_runner: failed to create persistent HiFT compute context\n");
+        return nullptr;
+    }
+    plan_value->speech_feat_c80_t_b =
+        ggml_cont(
+            plan_value->compute_ctx,
+            ggml_permute(
+                plan_value->compute_ctx,
+                plan_value->speech_upload_tcb,
+                1, 0, 2, 3));
+    plan_value->graph =
+        ggml_new_graph_custom(
+            plan_value->compute_ctx,
+            GGML_DEFAULT_GRAPH_SIZE * 256,
+            false);
+
+    {
+        omni::e2e_trace::span trace(
+            "hift", "build_alloc", ggml_backend_name(runner.model->backend));
+        omni::flow::profile::ScopeTimer timer("voc.build_alloc");
+        if (!runner.voc_hg2_runner_build_graph(
+                plan_value->compute_ctx,
+                plan_value->graph,
+                plan_value->speech_feat_c80_t_b,
+                plan_value->cache_source_t1_b,
+                &plan_value->wave_t_b,
+                &plan_value->source_t1_b)) {
+            std::fprintf(stderr, "voc_hg2_runner: failed to build persistent HiFT graph\n");
+            return nullptr;
+        }
+        plan_value->galloc =
+            ggml_gallocr_new(
+                ggml_backend_get_default_buffer_type(runner.model->backend));
+        if (!plan_value->galloc ||
+            !ggml_gallocr_alloc_graph(plan_value->galloc, plan_value->graph)) {
+            std::fprintf(stderr, "voc_hg2_runner: failed to allocate persistent HiFT graph\n");
+            return nullptr;
+        }
+    }
+
+    plan_value->compute_buffer = plan_value->wave_t_b->buffer;
+    plan_value->const_window = runner.model->hg2->gen.dsp.window;
+    plan_value->const_window_sq = runner.model->hg2->gen.dsp.window_sq;
+    plan_value->const_dft_cos_t = runner.model->hg2->gen.dsp.dft_cos_t;
+    plan_value->const_dft_sin_t = runner.model->hg2->gen.dsp.dft_sin_t;
+    plan_value->const_nyq_sign = runner.model->hg2->gen.dsp.nyq_sign;
+    plan_value->const_istft_ola_kernel =
+        runner.model->hg2->gen.dsp.istft_ola_kernel;
+    plan_value->const_harmonic_mul =
+        runner.model->hg2->gen.source_nsf.sine_gen.harmonic_mul;
+    if (!plan_value->compute_buffer) {
+        std::fprintf(stderr, "voc_hg2_runner: persistent HiFT compute buffer unavailable\n");
+        return nullptr;
+    }
+
+    plan_value->source_tail_len =
+        std::min<int64_t>(
+            kPersistentSourceCacheLen,
+            plan_value->source_t1_b->ne[0]);
+    plan_value->source_tail_flat =
+        ggml_view_1d(
+            plan_value->compute_ctx,
+            plan_value->source_t1_b,
+            plan_value->source_tail_len,
+            static_cast<size_t>(
+                plan_value->source_t1_b->ne[0] -
+                plan_value->source_tail_len) *
+                plan_value->source_t1_b->nb[0]);
+    plan_value->source_tail_flat->buffer =
+        plan_value->source_t1_b->buffer;
+
+    const omni::flow::hift_buffer_span input_spans[] = {
+        {
+            reinterpret_cast<uintptr_t>(
+                plan_value->speech_upload_tcb->data),
+            ggml_nbytes(plan_value->speech_upload_tcb),
+        },
+        {
+            reinterpret_cast<uintptr_t>(
+                plan_value->cache_source_t1_b->data),
+            ggml_nbytes(plan_value->cache_source_t1_b),
+        },
+    };
+    const omni::flow::hift_buffer_span output_spans[] = {
+        {
+            reinterpret_cast<uintptr_t>(plan_value->wave_t_b->data),
+            ggml_nbytes(plan_value->wave_t_b),
+        },
+        {
+            reinterpret_cast<uintptr_t>(plan_value->source_t1_b->data),
+            ggml_nbytes(plan_value->source_t1_b),
+        },
+    };
+    for (const auto & input_span : input_spans) {
+        for (const auto & output_span : output_spans) {
+            if (omni::flow::hift_buffer_spans_overlap(
+                    input_span, output_span)) {
+                std::fprintf(
+                    stderr,
+                    "voc_hg2_runner: persistent HiFT input/output buffers "
+                    "overlap; refusing unsafe plan\n");
+                return nullptr;
+            }
+        }
+    }
+
+    {
+        omni::e2e_trace::span trace(
+            "hift", "constants_upload",
+            ggml_backend_name(runner.model->backend));
+        omni::flow::profile::ScopeTimer timer("voc.upload.constants");
+        if (!plan_value->upload_constants(runner.model)) {
+            std::fprintf(
+                stderr,
+                "voc_hg2_runner: failed to upload persistent HiFT constants\n");
+            return nullptr;
+        }
+    }
+
+    plan_value->last_use = ++clock;
+    plan * inserted = plan_value.get();
+    plans.emplace(cache_key, std::move(plan_value));
+    std::fprintf(
+        stderr,
+        "voc_hg2_runner: built exact HiFT plan phase=%s T_mel=%lld Tc=%lld "
+        "plans=%zu\n",
+        cache_key.phase == omni::flow::hift_plan_phase::first ? "first" :
+        cache_key.phase == omni::flow::hift_plan_phase::final ? "final" :
+                                                               "steady",
+        (long long) cache_key.t_mel,
+        (long long) cache_key.tc,
+        plans.size());
+    return inserted;
+}
 
 voc_hg2_runner::voc_hg2_runner() = default;
 voc_hg2_runner::~voc_hg2_runner() = default;
@@ -6846,11 +7059,130 @@ bool voc_hg2_runner::configure_from_environment() {
     }
     std::fprintf(
         stderr,
-        "voc_hg2_runner: mode=%s exact_shape_cache_capacity=%zu source_cache=%s\n",
+        "voc_hg2_runner: mode=%s prewarm=%s exact_shape_cache_capacity=%zu "
+        "source_cache=%s\n",
         omni::flow::hift_runner_mode_name(state->config.mode),
+        omni::flow::hift_prewarm_mode_name(state->config.prewarm),
         state->config.plan_cache_capacity,
         state->config.mode == omni::flow::hift_runner_mode::ephemeral ? "host" : "device");
     persistent_ = std::move(state);
+    if (!prewarm_ready_plans()) {
+        clear_persistent_state();
+        return false;
+    }
+    return true;
+}
+
+bool voc_hg2_runner::prewarm_ready_plans() {
+    if (!persistent_ ||
+        persistent_->config.prewarm == omni::flow::hift_prewarm_mode::off) {
+        return true;
+    }
+    if (persistent_->config.mode !=
+            omni::flow::hift_runner_mode::persistent_graph ||
+        !model || !model->backend ||
+        !omni_cann_stage_exact_enabled(model->backend, "hift")) {
+        std::fprintf(
+            stderr,
+            "voc_hg2_runner: first_steady prewarm requires persistent_graph "
+            "and the hift stage_exact domain\n");
+        return false;
+    }
+
+    using phase = omni::flow::stage_exact_execution_phase;
+    const persistent_state::key contracts[] = {
+        {omni::flow::hift_plan_phase::first, 50, 0},
+        {omni::flow::hift_plan_phase::steady, 58, 3840},
+    };
+    for (const auto & contract : contracts) {
+        bool cache_hit = false;
+        persistent_state::plan * plan =
+            persistent_->get_or_create_plan(*this, contract, cache_hit);
+        if (!plan || plan->cache_key.t_mel != contract.t_mel ||
+            plan->cache_key.tc != contract.tc ||
+            plan->speech_upload_tcb->ne[0] != contract.t_mel ||
+            plan->cache_source_t1_b->ne[0] != contract.tc) {
+            std::fprintf(
+                stderr,
+                "voc_hg2_runner: HiFT prewarm shape contract failed "
+                "phase=%s T_mel=%lld Tc=%lld\n",
+                contract.phase == omni::flow::hift_plan_phase::first ?
+                    "first" : "steady",
+                (long long) contract.t_mel,
+                (long long) contract.tc);
+            return false;
+        }
+
+        ggml_backend_buffer_clear(plan->input_buffer, 0);
+        ggml_backend_buffer_clear(plan->compute_buffer, 0);
+        if (!plan->upload_constants(model)) {
+            std::fprintf(
+                stderr,
+                "voc_hg2_runner: failed to restore constants before "
+                "HiFT prewarm\n");
+            return false;
+        }
+
+        auto execute = [&](phase execution_phase) {
+            omni_set_cann_stage_exact_context(
+                model->backend,
+                "hift",
+                /*epoch=*/0,
+                omni::flow::stage_exact_capture_allowed(execution_phase),
+                contract.t_mel,
+                contract.tc,
+                reinterpret_cast<uintptr_t>(
+                    plan->speech_upload_tcb->data));
+            const ggml_status status =
+                ggml_backend_graph_compute(model->backend, plan->graph);
+            ggml_backend_synchronize(model->backend);
+            return status == GGML_STATUS_SUCCESS;
+        };
+
+        if (!execute(phase::warmup)) {
+            std::fprintf(
+                stderr,
+                "voc_hg2_runner: HiFT prewarm eager execution failed\n");
+            return false;
+        }
+        // The capture execution must see the same clean persistent arena that
+        // the first real request sees.
+        ggml_backend_buffer_clear(plan->compute_buffer, 0);
+        if (!plan->upload_constants(model) ||
+            !execute(phase::initialization_capture)) {
+            std::fprintf(
+                stderr,
+                "voc_hg2_runner: HiFT prewarm capture failed\n");
+            return false;
+        }
+
+        // Prewarm must not become logical stream history.  Preserve the graph
+        // and allocation addresses while restoring all mutable data.
+        ggml_backend_buffer_clear(plan->input_buffer, 0);
+        ggml_backend_buffer_clear(plan->compute_buffer, 0);
+        if (!plan->upload_constants(model)) {
+            std::fprintf(
+                stderr,
+                "voc_hg2_runner: failed to reset HiFT plan after capture\n");
+            return false;
+        }
+        ggml_backend_synchronize(model->backend);
+        plan->execution_count = 0;
+        plan->prewarmed = true;
+    }
+
+    persistent_->active_source_plan = nullptr;
+    persistent_->active_source_len = 0;
+    persistent_->session_epoch = 0;
+    persistent_->clock = 0;
+    for (auto & item : persistent_->plans) {
+        item.second->last_use = 0;
+    }
+    std::fprintf(
+        stderr,
+        "voc_hg2_runner: prewarmed exact HiFT plans "
+        "first{T_mel=50,Tc=0} steady{T_mel=58,Tc=3840}; "
+        "hot-path capture disabled\n");
     return true;
 }
 
@@ -6946,174 +7278,50 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
     if (persistent_device_cache) {
         using state_t = persistent_state;
         using plan_t = persistent_state::plan;
-        constexpr int64_t kPersistentSourceCacheLen =
-            8 * hifigan2::hg2_hift_generator::HG2_SAMPLES_PER_MEL;
 
         state_t & state = *persistent_;
         const omni::flow::hift_plan_phase stream_phase =
             omni::flow::hift_plan_phase_for(is_final, Tc);
         const state_t::key cache_key{stream_phase, T_mel, Tc};
-
-        auto found = state.plans.find(cache_key);
-        const bool plan_cache_hit = found != state.plans.end();
-        if (found == state.plans.end()) {
-            auto plan = std::make_unique<plan_t>();
-            plan->cache_key = cache_key;
-
-            ggml_init_params input_params{};
-            input_params.mem_size   = 16 * ggml_tensor_overhead();
-            input_params.mem_buffer = nullptr;
-            input_params.no_alloc   = true;
-            plan->input_ctx = ggml_init(input_params);
-            if (!plan->input_ctx) {
-                std::fprintf(stderr, "voc_hg2_runner: failed to create persistent HiFT input context\n");
+        if (state.config.prewarm ==
+                omni::flow::hift_prewarm_mode::first_steady &&
+            stream_phase != omni::flow::hift_plan_phase::final) {
+            const bool matches_contract =
+                (stream_phase == omni::flow::hift_plan_phase::first &&
+                 T_mel == 50 && Tc == 0) ||
+                (stream_phase == omni::flow::hift_plan_phase::steady &&
+                 T_mel == 58 && Tc == 3840);
+            if (!matches_contract) {
+                std::fprintf(
+                    stderr,
+                    "voc_hg2_runner: runtime HiFT shape violates prewarmed "
+                    "contract phase=%s T_mel=%lld Tc=%lld\n",
+                    stream_phase == omni::flow::hift_plan_phase::first ?
+                        "first" : "steady",
+                    (long long) T_mel,
+                    (long long) Tc);
                 return false;
             }
-
-            plan->speech_upload_tcb =
-                ggml_new_tensor_3d(plan->input_ctx, GGML_TYPE_F32, T_mel, C, B);
-            plan->cache_source_t1_b =
-                ggml_new_tensor_3d(plan->input_ctx, GGML_TYPE_F32, Tc, 1, B);
-            ggml_set_input(plan->speech_upload_tcb);
-            ggml_set_input(plan->cache_source_t1_b);
-            if (Tc > 0) {
-                plan->cache_source_flat =
-                    ggml_view_1d(plan->input_ctx, plan->cache_source_t1_b, Tc, 0);
-            }
-            plan->input_buffer =
-                ggml_backend_alloc_ctx_tensors(plan->input_ctx, model->backend);
-            if (!plan->input_buffer) {
-                std::fprintf(stderr, "voc_hg2_runner: failed to allocate persistent HiFT inputs\n");
-                return false;
-            }
-
-            ggml_init_params compute_params{};
-            compute_params.mem_size   = 2048ull * 1024ull * 1024ull;
-            compute_params.mem_buffer = nullptr;
-            compute_params.no_alloc   = true;
-            plan->compute_ctx = ggml_init(compute_params);
-            if (!plan->compute_ctx) {
-                std::fprintf(stderr, "voc_hg2_runner: failed to create persistent HiFT compute context\n");
-                return false;
-            }
-            plan->speech_feat_c80_t_b =
-                ggml_cont(
-                    plan->compute_ctx,
-                    ggml_permute(
-                        plan->compute_ctx,
-                        plan->speech_upload_tcb,
-                        1, 0, 2, 3));
-            plan->graph =
-                ggml_new_graph_custom(
-                    plan->compute_ctx,
-                    GGML_DEFAULT_GRAPH_SIZE * 256,
-                    false);
-
-            {
-                omni::e2e_trace::span trace(
-                    "hift", "build_alloc", ggml_backend_name(model->backend));
-                omni::flow::profile::ScopeTimer timer("voc.build_alloc");
-                if (!voc_hg2_runner_build_graph(
-                        plan->compute_ctx,
-                        plan->graph,
-                        plan->speech_feat_c80_t_b,
-                        plan->cache_source_t1_b,
-                        &plan->wave_t_b,
-                        &plan->source_t1_b)) {
-                    std::fprintf(stderr, "voc_hg2_runner: failed to build persistent HiFT graph\n");
-                    return false;
-                }
-                plan->galloc =
-                    ggml_gallocr_new(ggml_backend_get_default_buffer_type(model->backend));
-                if (!plan->galloc || !ggml_gallocr_alloc_graph(plan->galloc, plan->graph)) {
-                    std::fprintf(stderr, "voc_hg2_runner: failed to allocate persistent HiFT graph\n");
-                    return false;
-                }
-            }
-
-            plan->compute_buffer = plan->wave_t_b->buffer;
-            plan->const_window = model->hg2->gen.dsp.window;
-            plan->const_window_sq = model->hg2->gen.dsp.window_sq;
-            plan->const_dft_cos_t = model->hg2->gen.dsp.dft_cos_t;
-            plan->const_dft_sin_t = model->hg2->gen.dsp.dft_sin_t;
-            plan->const_nyq_sign = model->hg2->gen.dsp.nyq_sign;
-            plan->const_istft_ola_kernel =
-                model->hg2->gen.dsp.istft_ola_kernel;
-            plan->const_harmonic_mul =
-                model->hg2->gen.source_nsf.sine_gen.harmonic_mul;
-            if (!plan->compute_buffer) {
-                std::fprintf(stderr, "voc_hg2_runner: persistent HiFT compute buffer unavailable\n");
-                return false;
-            }
-
-            plan->source_tail_len =
-                std::min<int64_t>(kPersistentSourceCacheLen, plan->source_t1_b->ne[0]);
-            plan->source_tail_flat = ggml_view_1d(
-                plan->compute_ctx,
-                plan->source_t1_b,
-                plan->source_tail_len,
-                static_cast<size_t>(plan->source_t1_b->ne[0] - plan->source_tail_len) *
-                    plan->source_t1_b->nb[0]);
-            plan->source_tail_flat->buffer = plan->source_t1_b->buffer;
-
-            const omni::flow::hift_buffer_span input_spans[] = {
-                {
-                    reinterpret_cast<uintptr_t>(plan->speech_upload_tcb->data),
-                    ggml_nbytes(plan->speech_upload_tcb),
-                },
-                {
-                    reinterpret_cast<uintptr_t>(plan->cache_source_t1_b->data),
-                    ggml_nbytes(plan->cache_source_t1_b),
-                },
-            };
-            const omni::flow::hift_buffer_span output_spans[] = {
-                {
-                    reinterpret_cast<uintptr_t>(plan->wave_t_b->data),
-                    ggml_nbytes(plan->wave_t_b),
-                },
-                {
-                    reinterpret_cast<uintptr_t>(plan->source_t1_b->data),
-                    ggml_nbytes(plan->source_t1_b),
-                },
-            };
-            for (const auto & input_span : input_spans) {
-                for (const auto & output_span : output_spans) {
-                    if (omni::flow::hift_buffer_spans_overlap(input_span, output_span)) {
-                        std::fprintf(
-                            stderr,
-                            "voc_hg2_runner: persistent HiFT input/output buffers overlap; "
-                            "refusing unsafe plan\n");
-                        return false;
-                    }
-                }
-            }
-
-            {
-                omni::e2e_trace::span trace(
-                    "hift", "constants_upload", ggml_backend_name(model->backend));
-                omni::flow::profile::ScopeTimer timer("voc.upload.constants");
-                if (!plan->upload_constants(model)) {
-                    std::fprintf(stderr, "voc_hg2_runner: failed to upload persistent HiFT constants\n");
-                    return false;
-                }
-            }
-
-            plan->last_use = ++state.clock;
-            plan_t * inserted = plan.get();
-            state.plans.emplace(cache_key, std::move(plan));
-            found = state.plans.find(cache_key);
-            std::fprintf(
-                stderr,
-                "voc_hg2_runner: built exact HiFT plan phase=%s T_mel=%lld Tc=%lld plans=%zu\n",
-                stream_phase == omni::flow::hift_plan_phase::first ? "first" :
-                stream_phase == omni::flow::hift_plan_phase::final ? "final" : "steady",
-                (long long) T_mel,
-                (long long) Tc,
-                state.plans.size());
-            GGML_ASSERT(found != state.plans.end() && found->second.get() == inserted);
         }
 
-        plan_t & plan = *found->second;
+        bool plan_cache_hit = false;
+        plan_t * plan_ptr =
+            state.get_or_create_plan(*this, cache_key, plan_cache_hit);
+        if (!plan_ptr) {
+            return false;
+        }
+        if (state.config.prewarm ==
+                omni::flow::hift_prewarm_mode::first_steady &&
+            stream_phase != omni::flow::hift_plan_phase::final &&
+            !plan_cache_hit) {
+            std::fprintf(
+                stderr,
+                "voc_hg2_runner: prewarmed HiFT plan missing from hot path; "
+                "refusing late build\n");
+            return false;
+        }
+
+        plan_t & plan = *plan_ptr;
         plan.last_use = ++state.clock;
 
         // Preserve the previous output before writing any new input. The
@@ -7219,13 +7427,12 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
             omni::e2e_trace::span trace(
                 "hift", "compute", ggml_backend_name(model->backend));
             omni::flow::profile::ScopeTimer timer("voc.compute");
-            const bool allow_capture =
-                state.config.mode == omni::flow::hift_runner_mode::persistent_graph;
             omni_set_cann_stage_exact_context(
                 model->backend,
                 "hift",
                 /*epoch=*/0,
-                allow_capture,
+                omni::flow::stage_exact_capture_allowed(
+                    omni::flow::stage_exact_execution_phase::hot_path),
                 T_mel,
                 Tc,
                 reinterpret_cast<uintptr_t>(plan.speech_upload_tcb->data));
@@ -7301,7 +7508,8 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
         while (state.plans.size() > state.config.plan_cache_capacity) {
             auto victim = state.plans.end();
             for (auto it = state.plans.begin(); it != state.plans.end(); ++it) {
-                if (it->second.get() == state.active_source_plan) {
+                if (it->second.get() == state.active_source_plan ||
+                    it->second->prewarmed) {
                     continue;
                 }
                 if (victim == state.plans.end() ||
@@ -7419,7 +7627,9 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
         // and freshly allocated addresses are recorded, but it is never
         // graph-eligible and is not restructured here.
         omni_set_cann_stage_exact_context(
-            model->backend, "hift", /*epoch=*/0, /*allow_capture=*/false,
+            model->backend, "hift", /*epoch=*/0,
+            omni::flow::stage_exact_capture_allowed(
+                omni::flow::stage_exact_execution_phase::hot_path),
             T_mel, Tc, reinterpret_cast<uintptr_t>(speech_upload_tcb->data));
         const ggml_status st = ggml_backend_graph_compute(model->backend, gf);
         if (st != GGML_STATUS_SUCCESS) {
@@ -8512,7 +8722,9 @@ bool flowGGUFModelRunner::setup_cache(const int32_t *       token_bt,
                            capture_tokens.size() * sizeof(int32_t));
         runner_feed_enc_stream_pos(loader_.backend(), sess_->ctx, loader_.encoder());
 
-        auto prepare_and_compute = [&](bool last, bool allow_capture) {
+        auto prepare_and_compute = [&](
+                bool last,
+                omni::flow::stage_exact_execution_phase execution_phase) {
             const int call_id = last ? sess_->call_id_last : sess_->call_id_nonlast;
             ggml_tensor * feat = last ? sess_->out_feat_last_ctb : sess_->out_feat_nonlast_ctb;
             const int64_t tc = sess_->est_att_cache ? sess_->est_att_cache->ne[1] : 0;
@@ -8520,7 +8732,9 @@ bool flowGGUFModelRunner::setup_cache(const int32_t *       token_bt,
                                      feat->ne[0], feat->ne[1], B);
             omni_set_cann_stage_exact_context(
                 loader_.backend(), last ? "token2mel.last" : "token2mel.nonlast",
-                sess_->epoch, allow_capture, feat->ne[1], tc,
+                sess_->epoch,
+                omni::flow::stage_exact_capture_allowed(execution_phase),
+                feat->ne[1], tc,
                 reinterpret_cast<uintptr_t>(feat->data));
             const ggml_status graph_st = ggml_backend_graph_compute(
                 loader_.backend(), last ? sess_->gf_last : sess_->gf_nonlast);
@@ -8530,8 +8744,11 @@ bool flowGGUFModelRunner::setup_cache(const int32_t *       token_bt,
             return graph_st == GGML_STATUS_SUCCESS;
         };
 
-        if (!prepare_and_compute(false, false) || !prepare_and_compute(false, true) ||
-            !prepare_and_compute(true, false) || !prepare_and_compute(true, true)) {
+        using exact_phase = omni::flow::stage_exact_execution_phase;
+        if (!prepare_and_compute(false, exact_phase::warmup) ||
+            !prepare_and_compute(false, exact_phase::initialization_capture) ||
+            !prepare_and_compute(true, exact_phase::warmup) ||
+            !prepare_and_compute(true, exact_phase::initialization_capture)) {
             LOG_ERROR("flowGGUFModelRunner.setup_cache: CANN stage-exact warmup/capture failed\n");
             return false;
         }
@@ -8681,7 +8898,10 @@ bool flowGGUFModelRunner::inference_chunk(const int32_t *             token_bt,
         }
         omni_set_cann_stage_exact_context(
             loader_.backend(), last_chunk ? "token2mel.last" : "token2mel.nonlast",
-            sess_->epoch, /*allow_capture=*/false, T, last_att_len,
+            sess_->epoch,
+            omni::flow::stage_exact_capture_allowed(
+                omni::flow::stage_exact_execution_phase::hot_path),
+            T, last_att_len,
             reinterpret_cast<uintptr_t>(feat->data));
         const ggml_status st = ggml_backend_graph_compute(loader_.backend(), gf);
         if (disable_last_graph) {
@@ -9226,7 +9446,9 @@ bool flowGGUFModelRunner::init_from_host_caches(const flowStreamCacheHost & cach
                                          token_tb.size() * sizeof(int32_t));
         runner_feed_enc_stream_pos(loader_.backend(), sess_->ctx, loader_.encoder());
         const bool stage_exact = omni_cann_stage_exact_enabled(loader_.backend(), "token2mel");
-        auto prepare_and_compute = [&](bool last, bool allow_capture) {
+        auto prepare_and_compute = [&](
+                bool last,
+                omni::flow::stage_exact_execution_phase execution_phase) {
             const int call_id = last ? sess_->call_id_last : sess_->call_id_nonlast;
             ggml_tensor * feat = last ? sess_->out_feat_last_ctb : sess_->out_feat_nonlast_ctb;
             const int64_t tc = sess_->est_att_cache ? sess_->est_att_cache->ne[1] : 0;
@@ -9235,7 +9457,9 @@ bool flowGGUFModelRunner::init_from_host_caches(const flowStreamCacheHost & cach
             if (stage_exact) {
                 omni_set_cann_stage_exact_context(
                     loader_.backend(), last ? "token2mel.last" : "token2mel.nonlast",
-                    sess_->epoch, allow_capture, feat ? feat->ne[1] : 1, tc,
+                    sess_->epoch,
+                    omni::flow::stage_exact_capture_allowed(execution_phase),
+                    feat ? feat->ne[1] : 1, tc,
                     feat ? reinterpret_cast<uintptr_t>(feat->data) : 0);
             }
             const ggml_status graph_st = ggml_backend_graph_compute(
@@ -9243,10 +9467,17 @@ bool flowGGUFModelRunner::init_from_host_caches(const flowStreamCacheHost & cach
             ggml_backend_synchronize(loader_.backend());
             return graph_st == GGML_STATUS_SUCCESS;
         };
-        bool warmup_ok = prepare_and_compute(false, false);
+        using exact_phase = omni::flow::stage_exact_execution_phase;
+        bool warmup_ok =
+            prepare_and_compute(false, exact_phase::warmup);
         if (stage_exact) {
-            warmup_ok = warmup_ok && prepare_and_compute(false, true) &&
-                        prepare_and_compute(true, false) && prepare_and_compute(true, true);
+            warmup_ok =
+                warmup_ok &&
+                prepare_and_compute(
+                    false, exact_phase::initialization_capture) &&
+                prepare_and_compute(true, exact_phase::warmup) &&
+                prepare_and_compute(
+                    true, exact_phase::initialization_capture);
         }
         if (!warmup_ok) {
             LOG_ERROR("flowGGUFModelRunner.init_from_host_caches: graph warmup/capture failed\n");

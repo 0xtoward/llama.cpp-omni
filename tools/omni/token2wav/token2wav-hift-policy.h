@@ -16,6 +16,24 @@ enum class hift_runner_mode {
     persistent_graph,
 };
 
+enum class hift_prewarm_mode {
+    off,
+    first_steady,
+};
+
+// Exact graph capture is an initialization-only operation.  Keeping this
+// decision in a pure policy helper makes it difficult for a serving call site
+// to accidentally turn a cache miss into a hot-path capture.
+enum class stage_exact_execution_phase {
+    warmup,
+    initialization_capture,
+    hot_path,
+};
+
+inline bool stage_exact_capture_allowed(stage_exact_execution_phase phase) {
+    return phase == stage_exact_execution_phase::initialization_capture;
+}
+
 enum class hift_plan_phase : uint8_t {
     first,
     steady,
@@ -69,6 +87,7 @@ inline hift_plan_phase hift_plan_phase_for(bool is_final, int64_t tc) {
 
 struct hift_runner_config {
     hift_runner_mode mode = hift_runner_mode::ephemeral;
+    hift_prewarm_mode prewarm = hift_prewarm_mode::off;
     size_t           plan_cache_capacity = 6;
     std::string      error;
 
@@ -86,9 +105,18 @@ inline const char * hift_runner_mode_name(hift_runner_mode mode) {
     return "invalid";
 }
 
+inline const char * hift_prewarm_mode_name(hift_prewarm_mode mode) {
+    switch (mode) {
+        case hift_prewarm_mode::off:          return "off";
+        case hift_prewarm_mode::first_steady: return "first_steady";
+    }
+    return "invalid";
+}
+
 inline hift_runner_config parse_hift_runner_config(
         const char * mode_raw,
-        const char * capacity_raw) {
+        const char * capacity_raw,
+        const char * prewarm_raw = nullptr) {
     hift_runner_config result;
 
     const std::string mode = mode_raw == nullptr ? "ephemeral" : mode_raw;
@@ -100,6 +128,22 @@ inline hift_runner_config parse_hift_runner_config(
         result.mode = hift_runner_mode::persistent_graph;
     } else {
         result.error = "OMNI_HIFT_RUNNER must be ephemeral|persistent|persistent_graph";
+        return result;
+    }
+
+    const std::string prewarm = prewarm_raw == nullptr ? "off" : prewarm_raw;
+    if (prewarm == "off") {
+        result.prewarm = hift_prewarm_mode::off;
+    } else if (prewarm == "first_steady") {
+        result.prewarm = hift_prewarm_mode::first_steady;
+    } else {
+        result.error = "OMNI_HIFT_PREWARM must be off|first_steady";
+        return result;
+    }
+    if (result.prewarm == hift_prewarm_mode::first_steady &&
+        result.mode != hift_runner_mode::persistent_graph) {
+        result.error =
+            "OMNI_HIFT_PREWARM=first_steady requires OMNI_HIFT_RUNNER=persistent_graph";
         return result;
     }
 
@@ -117,6 +161,12 @@ inline hift_runner_config parse_hift_runner_config(
         }
         result.plan_cache_capacity = static_cast<size_t>(parsed);
     }
+    if (result.prewarm == hift_prewarm_mode::first_steady &&
+        result.plan_cache_capacity < 3) {
+        result.error =
+            "OMNI_HIFT_PREWARM=first_steady requires OMNI_HIFT_PLAN_CACHE_CAPACITY>=3";
+        return result;
+    }
 
     return result;
 }
@@ -124,7 +174,8 @@ inline hift_runner_config parse_hift_runner_config(
 inline hift_runner_config hift_runner_config_from_environment() {
     return parse_hift_runner_config(
         std::getenv("OMNI_HIFT_RUNNER"),
-        std::getenv("OMNI_HIFT_PLAN_CACHE_CAPACITY"));
+        std::getenv("OMNI_HIFT_PLAN_CACHE_CAPACITY"),
+        std::getenv("OMNI_HIFT_PREWARM"));
 }
 
 }  // namespace omni::flow

@@ -2039,6 +2039,7 @@ struct voc_hg2_runner {
 
   private:
     struct persistent_state;
+    bool prewarm_ready_plans();
     std::unique_ptr<persistent_state> persistent_;
 };
 }  // namespace vocoder

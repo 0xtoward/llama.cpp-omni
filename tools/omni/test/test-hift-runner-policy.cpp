@@ -11,6 +11,7 @@ int main() {
         const auto config = parse_hift_runner_config(nullptr, nullptr);
         CHECK(config);
         CHECK(config.mode == hift_runner_mode::ephemeral);
+        CHECK(config.prewarm == hift_prewarm_mode::off);
         CHECK(config.plan_cache_capacity == 6);
     }
     {
@@ -23,7 +24,15 @@ int main() {
         const auto config = parse_hift_runner_config("persistent_graph", "64");
         CHECK(config);
         CHECK(config.mode == hift_runner_mode::persistent_graph);
+        CHECK(config.prewarm == hift_prewarm_mode::off);
         CHECK(config.plan_cache_capacity == 64);
+    }
+    {
+        const auto config =
+            parse_hift_runner_config("persistent_graph", "6", "first_steady");
+        CHECK(config);
+        CHECK(config.mode == hift_runner_mode::persistent_graph);
+        CHECK(config.prewarm == hift_prewarm_mode::first_steady);
     }
     for (const char * invalid : { "", "on", "PERSISTENT", "graph" }) {
         CHECK(!parse_hift_runner_config(invalid, nullptr));
@@ -31,6 +40,13 @@ int main() {
     for (const char * invalid : { "", "0", "-1", "65", "1x" }) {
         CHECK(!parse_hift_runner_config("persistent", invalid));
     }
+    for (const char * invalid : { "", "on", "FIRST_STEADY" }) {
+        CHECK(!parse_hift_runner_config("persistent_graph", nullptr, invalid));
+    }
+    CHECK(!parse_hift_runner_config("ephemeral", nullptr, "first_steady"));
+    CHECK(!parse_hift_runner_config("persistent", nullptr, "first_steady"));
+    CHECK(!parse_hift_runner_config("persistent_graph", "1", "first_steady"));
+    CHECK(!parse_hift_runner_config("persistent_graph", "2", "first_steady"));
     {
         const hift_plan_key first{hift_plan_phase_for(false, 0), 28, 0};
         const hift_plan_key steady{hift_plan_phase_for(false, 3840), 33, 3840};
@@ -51,6 +67,12 @@ int main() {
         CHECK(!hift_plan_needs_workspace_scrub(0));
         CHECK(hift_plan_needs_workspace_scrub(1));
         CHECK(hift_plan_needs_workspace_scrub(7));
+    }
+    {
+        CHECK(!stage_exact_capture_allowed(stage_exact_execution_phase::warmup));
+        CHECK(stage_exact_capture_allowed(
+            stage_exact_execution_phase::initialization_capture));
+        CHECK(!stage_exact_capture_allowed(stage_exact_execution_phase::hot_path));
     }
 
     std::cout << "HiFT runner policy tests passed\n";
