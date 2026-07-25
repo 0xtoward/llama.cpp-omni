@@ -4387,6 +4387,7 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
                     std::getenv("OMNI_TTS_TRACE"),
                     std::getenv("OMNI_TTS_SUPPRESS_MODEL_LOGITS"),
                     std::getenv("OMNI_TTS_BASE_OUTPUT"),
+                    std::getenv("OMNI_TTS_DEVICE_BURST"),
                     config,
                     error)) {
             LOG_ERR("TTS device-head configuration failed: %s\n", error.c_str());
@@ -4404,6 +4405,14 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
                 tts_suppress_model_logits ? 1 : 0);
         if (tts_output_contract == LLAMA_OUTPUT_HIDDEN_ONLY && !use_tts) {
             LOG_ERR("OMNI_TTS_BASE_OUTPUT=hidden_only requires TTS to be enabled\n");
+            delete ctx_omni;
+            return nullptr;
+        }
+        if (config.device_burst == 4) {
+            LOG_ERR(
+                    "OMNI_TTS_DEVICE_BURST=4 is not service-ready: the device-side "
+                    "repetition state, four-step decoder loop, and checked KV suffix "
+                    "rollback are not wired; refusing to fall back to per-code Host sync\n");
             delete ctx_omni;
             return nullptr;
         }

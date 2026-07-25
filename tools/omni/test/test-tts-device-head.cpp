@@ -71,14 +71,15 @@ static void test_config() {
     std::string error;
 
     assert(omni::tts_device_head_parse_config(
-            nullptr, nullptr, nullptr, nullptr, nullptr, config, error));
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, config, error));
     assert(config.mode == omni::tts_head_mode::cpu);
     assert(!config.device_sampler);
     assert(config.suppress_model_logits);
     assert(config.base_output == LLAMA_OUTPUT_DEFAULT);
+    assert(config.device_burst == 1);
 
     assert(omni::tts_device_head_parse_config(
-            "cann", "1", "1", "0", "full", config, error));
+            "cann", "1", "1", "0", "full", "1", config, error));
     assert(config.mode == omni::tts_head_mode::cann);
     assert(config.device_sampler);
     assert(config.trace);
@@ -86,27 +87,103 @@ static void test_config() {
     assert(config.base_output == LLAMA_OUTPUT_DEFAULT);
 
     assert(omni::tts_device_head_parse_config(
-            "cann", "1", "0", "1", "hidden_only", config, error));
+            "cann", "1", "0", "1", "hidden_only", "4", config, error));
     assert(config.base_output == LLAMA_OUTPUT_HIDDEN_ONLY);
+    assert(config.device_burst == 4);
 
     assert(!omni::tts_device_head_parse_config(
-            "cann", "0", nullptr, nullptr, nullptr, config, error));
+            "cann", "0", nullptr, nullptr, nullptr, nullptr, config, error));
     assert(!error.empty());
     assert(!omni::tts_device_head_parse_config(
-            "bogus", nullptr, nullptr, nullptr, nullptr, config, error));
+            "bogus", nullptr, nullptr, nullptr, nullptr, nullptr, config, error));
     assert(!omni::tts_device_head_parse_config(
-            "cann", "1", nullptr, "bogus", nullptr, config, error));
+            "cann", "1", nullptr, "bogus", nullptr, nullptr, config, error));
     assert(error == "OMNI_TTS_SUPPRESS_MODEL_LOGITS must be 0 or 1");
     assert(!omni::tts_device_head_parse_config(
-            "cann", "1", nullptr, nullptr, "bogus", config, error));
+            "cann", "1", nullptr, nullptr, "bogus", nullptr, config, error));
     assert(error == "OMNI_TTS_BASE_OUTPUT must be full or hidden_only");
     assert(!omni::tts_device_head_parse_config(
-            "cpu", "0", nullptr, nullptr, "hidden_only", config, error));
+            "cpu", "0", nullptr, nullptr, "hidden_only", nullptr, config, error));
     assert(error == "OMNI_TTS_BASE_OUTPUT=hidden_only requires OMNI_TTS_HEAD=cann");
     assert(!omni::tts_device_head_parse_config(
-            "cann", "1", nullptr, "0", "hidden_only", config, error));
+            "cann", "1", nullptr, "0", "hidden_only", nullptr, config, error));
     assert(error ==
            "OMNI_TTS_BASE_OUTPUT=hidden_only conflicts with OMNI_TTS_SUPPRESS_MODEL_LOGITS=0");
+    assert(!omni::tts_device_head_parse_config(
+            "cann", "1", nullptr, "1", "hidden_only", "2", config, error));
+    assert(error == "OMNI_TTS_DEVICE_BURST must be 1 or 4");
+    assert(!omni::tts_device_head_parse_config(
+            "cann", "1", nullptr, "1", "full", "4", config, error));
+    assert(error ==
+           "OMNI_TTS_DEVICE_BURST=4 requires OMNI_TTS_BASE_OUTPUT=hidden_only");
+}
+
+static void test_burst_eos_and_kv_rollback() {
+    for (int eos_slot = 0; eos_slot < 4; ++eos_slot) {
+        omni::tts_device_burst_state state(4);
+        std::string error;
+        assert(state.reset(7, error));
+        assert(state.begin(7, error));
+        for (int i = 0; i < 4; ++i) {
+            assert(state.append(7, 100 + i, i == eos_slot, error));
+        }
+
+        omni::tts_device_burst_event event;
+        assert(state.finish(
+                7, /*keep_stop_embedding=*/false, event, error));
+        assert(event.epoch == 7);
+        assert(event.valid_count == 4);
+        assert(event.accepted_count == eos_slot);
+        assert(event.kv_rollback_count == 4 - eos_slot);
+        assert(event.stops[eos_slot] == 1);
+        const auto recent = state.recent_tokens();
+        assert(static_cast<int>(recent.size()) == eos_slot);
+        for (int i = 0; i < eos_slot; ++i) {
+            assert(recent[i] == 100 + i);
+        }
+    }
+
+    omni::tts_device_burst_state final_state(4);
+    std::string error;
+    assert(final_state.reset(9, error));
+    assert(final_state.begin(9, error));
+    for (int i = 0; i < 4; ++i) {
+        assert(final_state.append(9, 200 + i, i == 2, error));
+    }
+    omni::tts_device_burst_event final_event;
+    assert(final_state.finish(
+            9, /*keep_stop_embedding=*/true, final_event, error));
+    assert(final_event.accepted_count == 3);
+    assert(final_event.kv_rollback_count == 1);
+}
+
+static void test_burst_epoch_reset_and_cancel() {
+    omni::tts_device_burst_state state(4);
+    std::string error;
+    assert(state.reset(10, error));
+    assert(state.begin(10, error));
+    assert(state.append(10, 1, false, error));
+    assert(state.cancel(11, error));
+    assert(state.epoch() == 11);
+    assert(state.valid_count() == 0);
+    assert(state.recent_tokens().empty());
+
+    assert(!state.append(10, 2, false, error));
+    assert(error == "TTS device burst append rejected a stale epoch");
+    assert(!state.begin(10, error));
+    assert(error == "TTS device burst begin rejected a stale epoch");
+    assert(!state.cancel(11, error));
+    assert(error == "TTS device burst cancel requires a newer epoch");
+
+    assert(state.begin(11, error));
+    for (int i = 0; i < 4; ++i) {
+        assert(state.append(11, 10 + i, false, error));
+    }
+    omni::tts_device_burst_event event;
+    assert(!state.finish(10, false, event, error));
+    assert(error == "TTS device burst finish rejected a stale epoch");
+    assert(state.finish(11, false, event, error));
+    assert(event.accepted_count == 4);
 }
 
 static void test_output_contract_participates_in_graph_reuse() {
@@ -369,7 +446,12 @@ static void test_fixed_uniform_32_codes(bool apply_top_k_p) {
     assert(initialized);
 
     std::vector<int32_t> recent;
+    omni::tts_device_burst_state burst_state(4);
+    assert(burst_state.reset(32, error));
     for (int step_idx = 0; step_idx < 32; ++step_idx) {
+        if (step_idx % 4 == 0) {
+            assert(burst_state.begin(32, error));
+        }
         const float uniform =
                 (static_cast<float>((step_idx * 37) % 97) + 0.25f) / 98.0f;
         omni::tts_device_head_step step;
@@ -404,6 +486,26 @@ static void test_fixed_uniform_32_codes(bool apply_top_k_p) {
             std::abort();
         }
         recent.push_back(actual);
+        assert(burst_state.append(
+                32, actual, /*stop=*/false, error));
+        if (step_idx % 4 == 3) {
+            omni::tts_device_burst_event event;
+            assert(burst_state.finish(
+                    32, /*keep_stop_embedding=*/false, event, error));
+            assert(event.valid_count == 4);
+            assert(event.accepted_count == 4);
+            assert(event.kv_rollback_count == 0);
+            const auto ring_recent = burst_state.recent_tokens();
+            const size_t expected_size =
+                    std::min<size_t>(
+                            recent.size(),
+                            omni::tts_device_burst_state::recent_capacity);
+            assert(ring_recent.size() == expected_size);
+            assert(std::equal(
+                    ring_recent.begin(),
+                    ring_recent.end(),
+                    recent.end() - expected_size));
+        }
     }
 
     runner.reset();
@@ -414,6 +516,8 @@ static void test_fixed_uniform_32_codes(bool apply_top_k_p) {
 
 int main() {
     test_config();
+    test_burst_eos_and_kv_rollback();
+    test_burst_epoch_reset_and_cancel();
     test_output_contract_participates_in_graph_reuse();
     test_greedy_device_graph();
     test_fixed_uniform_32_codes(/*apply_top_k_p=*/false);

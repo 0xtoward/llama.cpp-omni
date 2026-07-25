@@ -2,6 +2,7 @@
 
 #include "../../src/llama-ext.h"
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -20,6 +21,7 @@ struct tts_device_head_config {
     bool trace = false;
     bool suppress_model_logits = true;
     enum llama_output_contract base_output = LLAMA_OUTPUT_DEFAULT;
+    int32_t device_burst = 1;
 };
 
 bool tts_device_head_parse_config(
@@ -28,8 +30,63 @@ bool tts_device_head_parse_config(
         const char * trace,
         const char * suppress_model_logits,
         const char * base_output,
+        const char * device_burst,
         tts_device_head_config & config,
         std::string & error);
+
+// Protocol state for the future device-resident four-code loop.
+//
+// This class deliberately contains no backend execution.  It defines and
+// validates the state that a CANN implementation must keep on device:
+// recent_ids, token/stop rings, valid_count and epoch.  Keeping the protocol
+// independently testable lets the service fail closed until both the decoder
+// loop and KV suffix rollback are wired to this exact contract.
+struct tts_device_burst_event {
+    uint64_t epoch = 0;
+    std::array<int32_t, 4> tokens = {};
+    std::array<uint8_t, 4> stops = {};
+    int32_t valid_count = 0;
+    int32_t accepted_count = 0;
+    int32_t kv_rollback_count = 0;
+};
+
+class tts_device_burst_state {
+public:
+    static constexpr int32_t max_burst = 4;
+    static constexpr int32_t recent_capacity = 16;
+
+    explicit tts_device_burst_state(int32_t burst_width = 1);
+
+    bool reset(uint64_t epoch, std::string & error);
+    bool cancel(uint64_t next_epoch, std::string & error);
+    bool begin(uint64_t epoch, std::string & error);
+    bool append(
+            uint64_t epoch,
+            int32_t relative_token,
+            bool stop,
+            std::string & error);
+    bool finish(
+            uint64_t epoch,
+            bool keep_stop_embedding,
+            tts_device_burst_event & event,
+            std::string & error);
+
+    uint64_t epoch() const;
+    int32_t burst_width() const;
+    int32_t valid_count() const;
+    std::vector<int32_t> recent_tokens() const;
+
+private:
+    int32_t width = 1;
+    uint64_t current_epoch = 0;
+    bool active = false;
+    std::array<int32_t, recent_capacity> recent_ids = {};
+    int32_t recent_begin = 0;
+    int32_t recent_count = 0;
+    std::array<int32_t, max_burst> token_ring = {};
+    std::array<uint8_t, max_burst> stop_ring = {};
+    int32_t pending_count = 0;
+};
 
 struct tts_device_head_step {
     std::vector<int32_t> recent_relative_tokens;

@@ -57,6 +57,7 @@ bool tts_device_head_parse_config(
         const char * trace,
         const char * suppress_model_logits,
         const char * base_output,
+        const char * device_burst,
         tts_device_head_config & config,
         std::string & error) {
     config = {};
@@ -96,6 +97,16 @@ bool tts_device_head_parse_config(
         error = "OMNI_TTS_BASE_OUTPUT must be full or hidden_only";
         return false;
     }
+    const std::string burst =
+            device_burst && device_burst[0] ? device_burst : "1";
+    if (burst == "1") {
+        config.device_burst = 1;
+    } else if (burst == "4") {
+        config.device_burst = 4;
+    } else {
+        error = "OMNI_TTS_DEVICE_BURST must be 1 or 4";
+        return false;
+    }
     if (config.mode == tts_head_mode::cann && !config.device_sampler) {
         error = "OMNI_TTS_HEAD=cann requires OMNI_TTS_DEVICE_SAMPLER=1";
         return false;
@@ -114,7 +125,168 @@ bool tts_device_head_parse_config(
         error = "OMNI_TTS_BASE_OUTPUT=hidden_only conflicts with OMNI_TTS_SUPPRESS_MODEL_LOGITS=0";
         return false;
     }
+    if (config.device_burst == 4 &&
+        config.base_output != LLAMA_OUTPUT_HIDDEN_ONLY) {
+        error = "OMNI_TTS_DEVICE_BURST=4 requires OMNI_TTS_BASE_OUTPUT=hidden_only";
+        return false;
+    }
+    if (config.device_burst == 4 &&
+        (config.mode != tts_head_mode::cann || !config.device_sampler)) {
+        error = "OMNI_TTS_DEVICE_BURST=4 requires OMNI_TTS_HEAD=cann and OMNI_TTS_DEVICE_SAMPLER=1";
+        return false;
+    }
     return true;
+}
+
+tts_device_burst_state::tts_device_burst_state(int32_t burst_width)
+        : width(burst_width) {
+}
+
+bool tts_device_burst_state::reset(uint64_t epoch, std::string & error) {
+    if (width != 1 && width != max_burst) {
+        error = "TTS device burst width must be 1 or 4";
+        return false;
+    }
+    current_epoch = epoch;
+    active = false;
+    recent_ids.fill(0);
+    recent_begin = 0;
+    recent_count = 0;
+    token_ring.fill(0);
+    stop_ring.fill(0);
+    pending_count = 0;
+    error.clear();
+    return true;
+}
+
+bool tts_device_burst_state::cancel(
+        uint64_t next_epoch,
+        std::string & error) {
+    if (next_epoch <= current_epoch) {
+        error = "TTS device burst cancel requires a newer epoch";
+        return false;
+    }
+    return reset(next_epoch, error);
+}
+
+bool tts_device_burst_state::begin(uint64_t epoch, std::string & error) {
+    if (epoch != current_epoch) {
+        error = "TTS device burst begin rejected a stale epoch";
+        return false;
+    }
+    if (active) {
+        error = "TTS device burst is already active";
+        return false;
+    }
+    active = true;
+    token_ring.fill(0);
+    stop_ring.fill(0);
+    pending_count = 0;
+    error.clear();
+    return true;
+}
+
+bool tts_device_burst_state::append(
+        uint64_t epoch,
+        int32_t relative_token,
+        bool stop,
+        std::string & error) {
+    if (epoch != current_epoch) {
+        error = "TTS device burst append rejected a stale epoch";
+        return false;
+    }
+    if (!active) {
+        error = "TTS device burst append requires begin";
+        return false;
+    }
+    if (pending_count >= width) {
+        error = "TTS device burst ring is full";
+        return false;
+    }
+    token_ring[pending_count] = relative_token;
+    stop_ring[pending_count] = stop ? 1 : 0;
+    ++pending_count;
+    error.clear();
+    return true;
+}
+
+bool tts_device_burst_state::finish(
+        uint64_t epoch,
+        bool keep_stop_embedding,
+        tts_device_burst_event & event,
+        std::string & error) {
+    if (epoch != current_epoch) {
+        error = "TTS device burst finish rejected a stale epoch";
+        return false;
+    }
+    if (!active) {
+        error = "TTS device burst finish requires begin";
+        return false;
+    }
+    if (pending_count != width) {
+        error = "TTS device burst finish requires a full ring";
+        return false;
+    }
+
+    int32_t first_stop = pending_count;
+    for (int32_t i = 0; i < pending_count; ++i) {
+        if (stop_ring[i]) {
+            first_stop = i;
+            break;
+        }
+    }
+    int32_t accepted = first_stop;
+    if (first_stop < pending_count && keep_stop_embedding) {
+        ++accepted;
+    }
+
+    event = {};
+    event.epoch = current_epoch;
+    event.tokens = token_ring;
+    event.stops = stop_ring;
+    event.valid_count = pending_count;
+    event.accepted_count = accepted;
+    event.kv_rollback_count = pending_count - accepted;
+
+    // Only committed tokens enter repetition history.  Tokens after the first
+    // stop are speculative suffix and must not affect the next epoch/turn.
+    for (int32_t i = 0; i < accepted; ++i) {
+        if (recent_count < recent_capacity) {
+            recent_ids[(recent_begin + recent_count) % recent_capacity] =
+                    token_ring[i];
+            ++recent_count;
+        } else {
+            recent_ids[recent_begin] = token_ring[i];
+            recent_begin = (recent_begin + 1) % recent_capacity;
+        }
+    }
+
+    active = false;
+    pending_count = 0;
+    error.clear();
+    return true;
+}
+
+uint64_t tts_device_burst_state::epoch() const {
+    return current_epoch;
+}
+
+int32_t tts_device_burst_state::burst_width() const {
+    return width;
+}
+
+int32_t tts_device_burst_state::valid_count() const {
+    return pending_count;
+}
+
+std::vector<int32_t> tts_device_burst_state::recent_tokens() const {
+    std::vector<int32_t> result;
+    result.reserve(recent_count);
+    for (int32_t i = 0; i < recent_count; ++i) {
+        result.push_back(
+                recent_ids[(recent_begin + i) % recent_capacity]);
+    }
+    return result;
 }
 
 struct tts_device_head::impl {
