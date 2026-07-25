@@ -13,6 +13,7 @@
 #include <new>
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
+#include "token2wav-device-bridge-policy.h"
 
 namespace omni {
 namespace flow_matching {
@@ -1621,6 +1622,24 @@ class flowGGUFModelLoader {
 }  // namespace omni
 namespace omni {
 namespace flow {
+struct borrowed_device_tensor {
+    borrowed_device_tensor_contract contract{};
+    ggml_backend_t                   backend = nullptr;
+    const ggml_tensor *              tensor = nullptr;
+    int64_t                          stride_bytes[3] = {0, 0, 0};
+    const char *                     role = nullptr;
+
+    void clear() {
+        contract = {};
+        backend = nullptr;
+        tensor = nullptr;
+        stride_bytes[0] = 0;
+        stride_bytes[1] = 0;
+        stride_bytes[2] = 0;
+        role = nullptr;
+    }
+};
+
 struct flowStreamCacheHost {
     std::vector<uint8_t> conformer_cnn_cache;
     std::vector<int64_t> conformer_cnn_ne;
@@ -1684,7 +1703,9 @@ class flowGGUFModelRunner {
                          int                         n_timesteps,
                          float                       temperature,
                          std::vector<float> &        mel_bct_out,
-                         flowStreamCacheHost &       cache_out);
+                         flowStreamCacheHost &       cache_out,
+                         borrowed_device_tensor *    device_out = nullptr,
+                         bool                        download_to_host = true);
     bool init_from_host_caches(const flowStreamCacheHost & cache_host,
                                const float *               spk_bc,
                                int64_t                     B,
@@ -2014,6 +2035,9 @@ struct voc_hg2_runner {
 
     voc_hg2_model * model = nullptr;
     bool configure_from_environment();
+    bool configure_device_mel_bridge(
+        bool enabled,
+        ggml_backend_t producer_backend);
     void clear_persistent_state();
     void reset_session();
     bool uses_device_source_cache() const;
@@ -2035,7 +2059,9 @@ struct voc_hg2_runner {
                                     int64_t &                  out_T_audio,
                                     std::vector<float> &       out_source_bt1,
                                     int64_t &                  out_T_source,
-                                    bool                       is_final = false);
+                                    bool                       is_final = false,
+                                    const omni::flow::borrowed_device_tensor *
+                                        device_mel = nullptr);
 
   private:
     struct persistent_state;
@@ -2084,6 +2110,11 @@ class Token2Mel {
                                              float               temperature = -1.0f);
 
     bool push_tokens(const int32_t * tokens, int64_t n_tokens, bool is_final, std::vector<float> & mel_bct_out);
+    bool push_tokens_device(
+        const int32_t *       tokens,
+        int64_t               n_tokens,
+        bool                  is_final,
+        borrowed_device_tensor & device_mel_out);
 
     bool push_tokens(const std::vector<int32_t> & tokens, bool is_final, std::vector<float> & mel_bct_out) {
         return push_tokens(tokens.data(), (int64_t) tokens.size(), is_final, mel_bct_out);
@@ -2121,6 +2152,10 @@ class Token2Mel {
 
     bool ensure_ready_for_infer() const;
     bool infer_one_chunk(const std::vector<int32_t> & chunk_bt, bool last_chunk, std::vector<float> & mel_bct);
+    bool infer_one_chunk_device(
+        const std::vector<int32_t> & chunk_bt,
+        bool                         last_chunk,
+        borrowed_device_tensor &     device_mel_out);
 
     // CoreML 路径：encoder via GGUF runner 输出 mu，DiT × n_timesteps 走 CoreML。
     bool start_stream_ane_(const flowStreamCacheHost & host_cache);
@@ -2270,6 +2305,8 @@ class Token2Wav {
     std::vector<float> voc_speech_cache_bt_;
     std::vector<float> voc_speech_window_;
 
+    bool device_bridge_enabled_ = false;
+    int64_t voc_mel_device_tail_frames_ = 0;
     bool models_loaded_ = false;
 };
 

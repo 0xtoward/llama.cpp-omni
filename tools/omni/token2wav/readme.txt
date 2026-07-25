@@ -62,3 +62,19 @@ reset()
   OMNI_HIFT_PREWARM 的合法值只有 off / first_steady。first_steady 要求
   persistent_graph、hift stage_exact 域和至少 3 个 plan cache slot；
   任一条件不满足都会在启动时 fail closed。
+
+6. Token2Mel -> HiFT 设备桥（Ascend/CANN 实验）
+  默认仍使用现有 Host mel bridge。显式开启：
+
+    OMNI_T2W_DEVICE_BRIDGE=1
+
+  只接受 0 / 1。开启后要求 Token2Mel 与 HiFT 都位于同一个 CANN
+  device，且 HiFT runner 必须为 persistent 或 persistent_graph。
+  Token2Mel 输出以借用式 CTB device tensor 发布；producer 显式同步后，
+  HiFT backend 在设备上完成 CTB->TCB、拼接 8 帧 mel tail、写入持久
+  speech input 并更新 device tail。mel 不再 D2H 后再 H2D；waveform
+  作为服务输出仍会 D2H。
+
+  device、epoch、dtype、shape 或跨 context D2D 执行不满足合同时直接
+  失败，不会静默回退 Host。该路径只证明 host_roundtrip_removed；
+  在 Memory/L2 trace 证明前不声称 tensor 一直片上驻留。

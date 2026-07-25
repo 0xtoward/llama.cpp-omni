@@ -6823,11 +6823,31 @@ struct voc_hg2_runner::persistent_state {
     int64_t  active_source_len = 0;
     uint64_t clock = 0;
     uint64_t session_epoch = 0;
+    bool     device_mel_bridge_enabled = false;
+    ggml_backend_t bridge_producer_backend = nullptr;
+    ggml_context * bridge_tail_ctx = nullptr;
+    ggml_backend_buffer_t bridge_tail_buffer = nullptr;
+    ggml_tensor * bridge_tail_tcb = nullptr;
+    int64_t bridge_tail_frames = 0;
+    uint64_t bridge_source_epoch = 0;
 
     plan * get_or_create_plan(
         voc_hg2_runner & runner,
         const key &      cache_key,
         bool &           cache_hit);
+    bool bridge_device_mel(
+        voc_hg2_runner &                         runner,
+        plan &                                   destination_plan,
+        const omni::flow::borrowed_device_tensor & source);
+
+    ~persistent_state() {
+        if (bridge_tail_buffer) {
+            ggml_backend_buffer_free(bridge_tail_buffer);
+        }
+        if (bridge_tail_ctx) {
+            ggml_free(bridge_tail_ctx);
+        }
+    }
 };
 
 voc_hg2_runner::persistent_state::plan *
@@ -7037,6 +7057,252 @@ voc_hg2_runner::persistent_state::get_or_create_plan(
     return inserted;
 }
 
+bool voc_hg2_runner::persistent_state::bridge_device_mel(
+        voc_hg2_runner &                           runner,
+        plan &                                     destination_plan,
+        const omni::flow::borrowed_device_tensor & source) {
+    if (!device_mel_bridge_enabled || !runner.model ||
+        !runner.model->backend || !bridge_producer_backend ||
+        !bridge_tail_tcb || !bridge_tail_buffer ||
+        !destination_plan.speech_upload_tcb) {
+        std::fprintf(
+            stderr,
+            "voc_hg2_runner: device mel bridge is not initialized\n");
+        return false;
+    }
+
+    const uintptr_t expected_device =
+        reinterpret_cast<uintptr_t>(
+            ggml_backend_get_device(runner.model->backend));
+    const uint64_t expected_source_epoch = bridge_source_epoch;
+    const std::string contract_error =
+        omni::flow::validate_borrowed_device_tensor_contract(
+            source.contract, expected_device, expected_source_epoch);
+    if (!contract_error.empty()) {
+        std::fprintf(
+            stderr,
+            "voc_hg2_runner: %s\n",
+            contract_error.c_str());
+        return false;
+    }
+    if (source.backend != bridge_producer_backend || !source.tensor ||
+        source.tensor->data !=
+            reinterpret_cast<void *>(source.contract.data) ||
+        source.tensor->type != GGML_TYPE_F32 ||
+        source.stride_bytes[0] !=
+            static_cast<int64_t>(source.tensor->nb[0]) ||
+        source.stride_bytes[1] !=
+            static_cast<int64_t>(source.tensor->nb[1]) ||
+        source.stride_bytes[2] !=
+            static_cast<int64_t>(source.tensor->nb[2])) {
+        std::fprintf(
+            stderr,
+            "voc_hg2_runner: borrowed mel tensor metadata does not match "
+            "the live producer tensor\n");
+        return false;
+    }
+#ifdef GGML_USE_CANN
+    if (!ggml_backend_is_cann(source.backend) ||
+        !ggml_backend_is_cann(runner.model->backend) ||
+        ggml_backend_get_device(source.backend) !=
+            ggml_backend_get_device(runner.model->backend)) {
+        std::fprintf(
+            stderr,
+            "voc_hg2_runner: borrowed mel tensor is not on the configured "
+            "CANN device\n");
+        return false;
+    }
+#else
+    std::fprintf(
+        stderr,
+        "voc_hg2_runner: device mel bridge reached a non-CANN build\n");
+    return false;
+#endif
+
+    const int64_t current_frames = source.contract.frames;
+    const int64_t total_frames = bridge_tail_frames + current_frames;
+    if (total_frames != destination_plan.cache_key.t_mel ||
+        destination_plan.speech_upload_tcb->ne[0] != total_frames ||
+        destination_plan.speech_upload_tcb->ne[1] != 80 ||
+        destination_plan.speech_upload_tcb->ne[2] != 1) {
+        std::fprintf(
+            stderr,
+            "voc_hg2_runner: device mel bridge shape mismatch "
+            "tail=%lld current=%lld destination=%lld\n",
+            (long long) bridge_tail_frames,
+            (long long) current_frames,
+            (long long) destination_plan.cache_key.t_mel);
+        return false;
+    }
+
+    // The producer graph has been synchronized before this borrowed
+    // descriptor is published.  The bridge graph executes on the HiFT
+    // backend and performs CTB -> TCB, prepends the persistent 8-frame mel
+    // tail, copies into the exact-shape HiFT input, and updates the tail
+    // without exposing mel to host memory.
+    constexpr size_t kBridgeGraphNodes = 32;
+    ggml_init_params params{};
+    params.mem_size =
+        32 * ggml_tensor_overhead() +
+        ggml_graph_overhead_custom(kBridgeGraphNodes, false);
+    params.mem_buffer = nullptr;
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        std::fprintf(
+            stderr,
+            "voc_hg2_runner: failed to create device mel bridge context\n");
+        return false;
+    }
+
+    ggml_tensor * source_ctb =
+        ggml_view_3d(
+            ctx,
+            const_cast<ggml_tensor *>(source.tensor),
+            source.contract.channels,
+            current_frames,
+            source.contract.batch,
+            static_cast<size_t>(source.stride_bytes[1]),
+            static_cast<size_t>(source.stride_bytes[2]),
+            0);
+    ggml_tensor * current_tcb =
+        ggml_cont(
+            ctx,
+            ggml_permute(ctx, source_ctb, 1, 0, 2, 3));
+    ggml_tensor * combined_tcb = current_tcb;
+    if (bridge_tail_frames > 0) {
+        ggml_tensor * tail_view =
+            ggml_view_3d(
+                ctx,
+                bridge_tail_tcb,
+                bridge_tail_frames,
+                80,
+                1,
+                bridge_tail_tcb->nb[1],
+                bridge_tail_tcb->nb[2],
+                0);
+        combined_tcb =
+            ggml_concat(ctx, tail_view, current_tcb, 0);
+    }
+
+    ggml_tensor * speech_copy =
+        ggml_cpy(
+            ctx,
+            combined_tcb,
+            destination_plan.speech_upload_tcb);
+    const int64_t keep_frames = std::min<int64_t>(8, total_frames);
+    const size_t tail_source_offset =
+        static_cast<size_t>(total_frames - keep_frames) *
+        combined_tcb->nb[0];
+    ggml_tensor * next_tail =
+        ggml_view_3d(
+            ctx,
+            combined_tcb,
+            keep_frames,
+            80,
+            1,
+            combined_tcb->nb[1],
+            combined_tcb->nb[2],
+            tail_source_offset);
+    ggml_tensor * tail_target =
+        ggml_view_3d(
+            ctx,
+            bridge_tail_tcb,
+            keep_frames,
+            80,
+            1,
+            bridge_tail_tcb->nb[1],
+            bridge_tail_tcb->nb[2],
+            0);
+    ggml_tensor * tail_copy = ggml_cpy(ctx, next_tail, tail_target);
+    ggml_set_output(speech_copy);
+    ggml_set_output(tail_copy);
+
+    ggml_cgraph * graph =
+        ggml_new_graph_custom(ctx, kBridgeGraphNodes, false);
+    ggml_build_forward_expand(graph, speech_copy);
+    ggml_build_forward_expand(graph, tail_copy);
+
+    ggml_gallocr_t galloc =
+        ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(
+                runner.model->backend));
+    if (!galloc || !ggml_gallocr_alloc_graph(galloc, graph)) {
+        if (galloc) {
+            ggml_gallocr_free(galloc);
+        }
+        ggml_free(ctx);
+        std::fprintf(
+            stderr,
+            "voc_hg2_runner: failed to allocate device mel bridge graph\n");
+        return false;
+    }
+
+    {
+        omni::e2e_trace::span trace(
+            "token2wav",
+            "mel_device_bridge",
+            ggml_backend_name(runner.model->backend));
+        omni::flow::profile::ScopeTimer timer("voc.mel_bridge.d2d");
+        // The HiFT backend may retain its most recent stage_exact invocation.
+        // This small bridge graph is intentionally eager and must never be
+        // mistaken for the prewarmed HiFT graph.
+        omni_set_cann_stage_exact_context(
+            runner.model->backend,
+            "",
+            0,
+            false,
+            0,
+            0,
+            0);
+        const ggml_status status =
+            ggml_backend_graph_compute(
+                runner.model->backend,
+                graph);
+        if (status != GGML_STATUS_SUCCESS) {
+            ggml_gallocr_free(galloc);
+            ggml_free(ctx);
+            std::fprintf(
+                stderr,
+                "voc_hg2_runner: Token2Mel->HiFT device bridge graph "
+                "failed; refusing host fallback\n");
+            return false;
+        }
+        ggml_backend_synchronize(runner.model->backend);
+    }
+
+    ggml_gallocr_free(galloc);
+    ggml_free(ctx);
+    bridge_tail_frames = keep_frames;
+    if (bridge_source_epoch == 0) {
+        bridge_source_epoch = source.contract.epoch;
+    }
+
+    auto & trace_state = omni::e2e_trace::global_state();
+    if (trace_state.tensor_enabled()) {
+        omni::e2e_trace::tensor_record mel;
+        mel.ids = omni::e2e_trace::current_context();
+        mel.stage = "token2wav";
+        mel.action = "mel_device_bridge";
+        mel.tensor_role = "token2mel_to_hift_mel";
+        mel.producer = "token2mel_cfm";
+        mel.consumer = "hift_generator";
+        mel.shape =
+            "[1,80," + std::to_string(total_frames) + "]";
+        mel.dtype = "f32";
+        mel.device = ggml_backend_name(runner.model->backend);
+        mel.transfer = "device_to_device";
+        mel.residency_claim = "host_roundtrip_removed";
+        mel.bytes =
+            static_cast<uint64_t>(total_frames) * 80 * sizeof(float);
+        mel.buffer_id = reinterpret_cast<uintptr_t>(
+            destination_plan.speech_upload_tcb->data);
+        mel.reused = true;
+        trace_state.append_tensor(mel);
+    }
+    return true;
+}
+
 voc_hg2_runner::voc_hg2_runner() = default;
 voc_hg2_runner::~voc_hg2_runner() = default;
 
@@ -7070,6 +7336,96 @@ bool voc_hg2_runner::configure_from_environment() {
         clear_persistent_state();
         return false;
     }
+    return true;
+}
+
+bool voc_hg2_runner::configure_device_mel_bridge(
+        bool enabled,
+        ggml_backend_t producer_backend) {
+    if (!persistent_) {
+        std::fprintf(
+            stderr,
+            "voc_hg2_runner: device mel bridge requires configured runner state\n");
+        return false;
+    }
+    if (!enabled) {
+        persistent_->device_mel_bridge_enabled = false;
+        persistent_->bridge_producer_backend = nullptr;
+        return true;
+    }
+    if (persistent_->config.mode ==
+            omni::flow::hift_runner_mode::ephemeral) {
+        std::fprintf(
+            stderr,
+            "voc_hg2_runner: OMNI_T2W_DEVICE_BRIDGE=1 requires "
+            "OMNI_HIFT_RUNNER=persistent|persistent_graph\n");
+        return false;
+    }
+    if (!model || !model->backend || !producer_backend) {
+        std::fprintf(
+            stderr,
+            "voc_hg2_runner: device mel bridge requires live producer and "
+            "HiFT backends\n");
+        return false;
+    }
+#ifndef GGML_USE_CANN
+    std::fprintf(
+        stderr,
+        "voc_hg2_runner: OMNI_T2W_DEVICE_BRIDGE=1 requires a CANN build\n");
+    return false;
+#else
+    if (!ggml_backend_is_cann(producer_backend) ||
+        !ggml_backend_is_cann(model->backend) ||
+        ggml_backend_get_device(producer_backend) !=
+            ggml_backend_get_device(model->backend)) {
+        std::fprintf(
+            stderr,
+            "voc_hg2_runner: device mel bridge requires Token2Mel and HiFT "
+            "CANN backends on the same device\n");
+        return false;
+    }
+#endif
+
+    ggml_init_params params{};
+    params.mem_size = 8 * ggml_tensor_overhead();
+    params.mem_buffer = nullptr;
+    params.no_alloc = true;
+    persistent_->bridge_tail_ctx = ggml_init(params);
+    if (!persistent_->bridge_tail_ctx) {
+        std::fprintf(
+            stderr,
+            "voc_hg2_runner: failed to create device mel tail context\n");
+        return false;
+    }
+    persistent_->bridge_tail_tcb =
+        ggml_new_tensor_3d(
+            persistent_->bridge_tail_ctx,
+            GGML_TYPE_F32,
+            8,
+            80,
+            1);
+    ggml_set_input(persistent_->bridge_tail_tcb);
+    ggml_set_output(persistent_->bridge_tail_tcb);
+    persistent_->bridge_tail_buffer =
+        ggml_backend_alloc_ctx_tensors(
+            persistent_->bridge_tail_ctx,
+            model->backend);
+    if (!persistent_->bridge_tail_buffer) {
+        std::fprintf(
+            stderr,
+            "voc_hg2_runner: failed to allocate device mel tail buffer\n");
+        return false;
+    }
+    ggml_backend_buffer_clear(persistent_->bridge_tail_buffer, 0);
+    ggml_backend_synchronize(model->backend);
+    persistent_->bridge_producer_backend = producer_backend;
+    persistent_->bridge_tail_frames = 0;
+    persistent_->bridge_source_epoch = 0;
+    persistent_->device_mel_bridge_enabled = true;
+    std::fprintf(
+        stderr,
+        "voc_hg2_runner: Token2Mel->HiFT device bridge enabled "
+        "(explicit producer synchronization, 8-frame device tail)\n");
     return true;
 }
 
@@ -7197,6 +7553,13 @@ void voc_hg2_runner::reset_session() {
     persistent_->active_source_plan = nullptr;
     persistent_->active_source_len = 0;
     persistent_->session_epoch++;
+    persistent_->bridge_tail_frames = 0;
+    persistent_->bridge_source_epoch = 0;
+    if (persistent_->device_mel_bridge_enabled &&
+        persistent_->bridge_tail_buffer && model && model->backend) {
+        ggml_backend_buffer_clear(persistent_->bridge_tail_buffer, 0);
+        ggml_backend_synchronize(model->backend);
+    }
 }
 
 bool voc_hg2_runner::uses_device_source_cache() const {
@@ -7251,7 +7614,9 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
                                                 int64_t &                  out_T_audio,
                                                 std::vector<float> &       out_source_bt1,
                                                 int64_t &                  out_T_source,
-                                                bool                       is_final) {
+                                                bool                       is_final,
+                                                const omni::flow::borrowed_device_tensor *
+                                                    device_mel) {
     if (!model || !model->hg2 || !model->backend || !model->galloc) {
         return false;
     }
@@ -7260,7 +7625,10 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
     if (T_mel <= 0) {
         return false;
     }
-    if (speech_feat_bct.size() != (size_t) (B * C * T_mel)) {
+    const bool has_device_mel = device_mel != nullptr;
+    if ((!has_device_mel &&
+         speech_feat_bct.size() != (size_t) (B * C * T_mel)) ||
+        (has_device_mel && !speech_feat_bct.empty())) {
         LOG_ERROR( "voc_hg2_runner_eval_stream: invalid speech_feat_bct size\n");
         return false;
     }
@@ -7268,6 +7636,21 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
         return false;
     }
     const bool persistent_device_cache = uses_device_source_cache();
+    if (has_device_mel &&
+        (!persistent_device_cache || !persistent_ ||
+         !persistent_->device_mel_bridge_enabled)) {
+        LOG_ERROR(
+            "voc_hg2_runner_eval_stream: device mel requires the configured "
+            "persistent CANN bridge\n");
+        return false;
+    }
+    if (!has_device_mel && persistent_ &&
+        persistent_->device_mel_bridge_enabled) {
+        LOG_ERROR(
+            "voc_hg2_runner_eval_stream: device bridge is enabled but no "
+            "borrowed mel tensor was supplied; refusing host fallback\n");
+        return false;
+    }
     if (!persistent_device_cache &&
         !(Tc == 0 && cache_source_bt1.empty()) &&
         (int64_t) cache_source_bt1.size() != Tc * B) {
@@ -7378,7 +7761,11 @@ bool voc_hg2_runner::voc_hg2_runner_eval_stream(const std::vector<float> & speec
             }
         }
 
-        {
+        if (has_device_mel) {
+            if (!state.bridge_device_mel(*this, plan, *device_mel)) {
+                return false;
+            }
+        } else {
             omni::e2e_trace::span trace(
                 "hift", "speech_h2d", ggml_backend_name(model->backend));
             omni::flow::profile::ScopeTimer timer("voc.upload.speech");
@@ -8795,9 +9182,14 @@ bool flowGGUFModelRunner::inference_chunk(const int32_t *             token_bt,
                                           int                         n_timesteps,
                                           float                       temperature,
                                           std::vector<float> &        mel_bct_out,
-                                          flowStreamCacheHost &       cache_out) {
+                                          flowStreamCacheHost &       cache_out,
+                                          borrowed_device_tensor *    device_out,
+                                          bool                        download_to_host) {
     mel_bct_out.clear();
     cache_out.clear();
+    if (device_out) {
+        device_out->clear();
+    }
     if (!token_bt || !spk_bc || B <= 0 || T_token <= 0) {
         return false;
     }
@@ -8914,7 +9306,35 @@ bool flowGGUFModelRunner::inference_chunk(const int32_t *             token_bt,
             ggml_backend_synchronize(loader_.backend());
         }
     }
-    {
+    if (device_out) {
+        device_out->backend = loader_.backend();
+        device_out->tensor = feat;
+        device_out->contract.source_device =
+            reinterpret_cast<uintptr_t>(
+                ggml_backend_get_device(loader_.backend()));
+        device_out->contract.data =
+            reinterpret_cast<uintptr_t>(feat->data);
+        device_out->contract.channels = C;
+        device_out->contract.frames = T;
+        device_out->contract.batch = feat->ne[2];
+        device_out->contract.bytes =
+            static_cast<size_t>(C * T * feat->ne[2]) * sizeof(float);
+        device_out->contract.dtype =
+            feat->type == GGML_TYPE_F32 ?
+                device_bridge_dtype::f32 :
+                device_bridge_dtype::unsupported;
+        // inference_chunk explicitly synchronizes the producer backend above.
+        device_out->contract.producer_synchronized = true;
+        device_out->contract.epoch = sess_->epoch;
+        device_out->stride_bytes[0] =
+            static_cast<int64_t>(feat->nb[0]);
+        device_out->stride_bytes[1] =
+            static_cast<int64_t>(feat->nb[1]);
+        device_out->stride_bytes[2] =
+            static_cast<int64_t>(feat->nb[2]);
+        device_out->role = "token2mel_mel_ctb";
+    }
+    if (download_to_host) {
         omni::e2e_trace::span trace(
             "token2mel", "mel_d2h", ggml_backend_name(loader_.backend()));
         omni::flow::profile::ScopeTimer _t("t2m.download");
@@ -8939,6 +9359,30 @@ bool flowGGUFModelRunner::inference_chunk(const int32_t *             token_bt,
             mel.transfer = "device_to_host";
             mel.residency_claim = "host_roundtrip_present";
             mel.bytes = static_cast<uint64_t>(feat_ctb.size()) * sizeof(float);
+            mel.buffer_id = reinterpret_cast<uintptr_t>(feat->data);
+            mel.reused = true;
+            trace_state.append_tensor(mel);
+        }
+    } else {
+        auto & trace_state = omni::e2e_trace::global_state();
+        if (trace_state.tensor_enabled()) {
+            omni::e2e_trace::tensor_record mel;
+            mel.ids = omni::e2e_trace::current_context();
+            mel.stage = "token2mel";
+            mel.action = "mel_device_output";
+            mel.tensor_role = "token2mel_mel";
+            mel.producer = "cfm";
+            mel.consumer = "hift_device_bridge";
+            mel.shape =
+                "[" + std::to_string(feat->ne[2]) + "," +
+                std::to_string(C) + "," + std::to_string(T) + "]";
+            mel.dtype = "f32";
+            mel.device = ggml_backend_name(loader_.backend());
+            mel.transfer = "device_to_device";
+            mel.residency_claim = "host_roundtrip_removed";
+            mel.bytes =
+                static_cast<uint64_t>(C * T * feat->ne[2]) *
+                sizeof(float);
             mel.buffer_id = reinterpret_cast<uintptr_t>(feat->data);
             mel.reused = true;
             trace_state.append_tensor(mel);
@@ -10011,6 +10455,43 @@ bool Token2Mel::infer_one_chunk(const std::vector<int32_t> & chunk_bt, bool last
     return true;
 }
 
+bool Token2Mel::infer_one_chunk_device(
+        const std::vector<int32_t> & chunk_bt,
+        bool                         last_chunk,
+        borrowed_device_tensor &     device_mel_out) {
+    device_mel_out.clear();
+    if (!ensure_ready_for_infer()) {
+        return false;
+    }
+    if (backend_kind_ != Backend::GGUF) {
+        LOG_ERROR(
+            "Token2Mel.infer_one_chunk_device: CoreML/ANE cannot expose a "
+            "CANN device tensor\n");
+        return false;
+    }
+    if ((int64_t) chunk_bt.size() != (int64_t) kDt) {
+        LOG_ERROR(
+            "Token2Mel.infer_one_chunk_device: expected dt=%d tokens, got %lld\n",
+            (int) kDt,
+            (long long) chunk_bt.size());
+        return false;
+    }
+
+    flowStreamCacheHost cache_out;
+    std::vector<float> no_host_mel;
+    if (!runner_.inference_chunk(
+            chunk_bt.data(), 1, kDt, spk_bc_.data(), kSpkDim,
+            last_chunk, cache_in_, n_timesteps_, temperature_,
+            no_host_mel, cache_out, &device_mel_out,
+            /*download_to_host=*/false)) {
+        LOG_ERROR(
+            "Token2Mel.infer_one_chunk_device: runner.inference_chunk failed\n");
+        return false;
+    }
+    cache_in_ = cache_out;
+    return true;
+}
+
 // ===========================================================================
 // CoreML 路径：encoder 走 GGUF Metal，DiT 走 CoreML
 // ===========================================================================
@@ -10446,6 +10927,58 @@ bool Token2Mel::push_tokens(const int32_t * tokens, int64_t n_tokens, bool is_fi
     return true;
 }
 
+bool Token2Mel::push_tokens_device(
+        const int32_t *       tokens,
+        int64_t               n_tokens,
+        bool                  is_final,
+        borrowed_device_tensor & device_mel_out) {
+    device_mel_out.clear();
+    if (!ensure_ready_for_infer()) {
+        return false;
+    }
+    if (n_tokens < 0 || n_tokens > kDt) {
+        LOG_ERROR(
+            "Token2Mel.push_tokens_device: expected 0 <= n_tokens <= %d, got %lld\n",
+            (int) kDt,
+            (long long) n_tokens);
+        return false;
+    }
+    if (n_tokens == 0) {
+        return true;
+    }
+    if (backend_kind_ != Backend::GGUF) {
+        LOG_ERROR(
+            "Token2Mel.push_tokens_device: device bridge requires GGUF/CANN Token2Mel\n");
+        return false;
+    }
+
+    std::vector<int32_t> chunk_bt((size_t) kDt, kPadToken);
+    if (tokens) {
+        std::memcpy(
+            chunk_bt.data(), tokens,
+            static_cast<size_t>(n_tokens) * sizeof(int32_t));
+    }
+    if (!infer_one_chunk_device(chunk_bt, is_final, device_mel_out)) {
+        return false;
+    }
+
+    const int64_t valid_frames =
+        std::min<int64_t>(
+            device_mel_out.contract.frames,
+            n_tokens * 2);
+    if (valid_frames <= 0) {
+        device_mel_out.clear();
+        return false;
+    }
+    device_mel_out.contract.frames = valid_frames;
+    device_mel_out.contract.bytes =
+        static_cast<size_t>(
+            device_mel_out.contract.channels *
+            valid_frames *
+            device_mel_out.contract.batch) * sizeof(float);
+    return true;
+}
+
 void Token2Mel::reset_stream() {
     runner_.reset_stream();
     stream_started_ = false;
@@ -10642,6 +11175,24 @@ bool Token2Wav::load_models(const std::string & encoder_gguf,
                             const std::string & coreml_model_path) {
     reset_stream();
 
+    const device_bridge_config bridge_config =
+        device_bridge_config_from_environment();
+    if (!bridge_config) {
+        LOG_ERROR(
+            "Token2Wav.load_models: %s\n",
+            bridge_config.error.c_str());
+        models_loaded_ = false;
+        return false;
+    }
+    device_bridge_enabled_ = bridge_config.enabled;
+    if (device_bridge_enabled_ && !coreml_model_path.empty()) {
+        LOG_ERROR(
+            "Token2Wav.load_models: OMNI_T2W_DEVICE_BRIDGE=1 rejects "
+            "CoreML/ANE Token2Mel\n");
+        models_loaded_ = false;
+        return false;
+    }
+
     const bool require_npu = token2wav_require_npu();
     if (require_npu) {
 #ifndef GGML_USE_CANN
@@ -10725,6 +11276,18 @@ bool Token2Wav::load_models(const std::string & encoder_gguf,
         models_loaded_ = false;
         return false;
     }
+    if (!voc_runner_.configure_device_mel_bridge(
+            device_bridge_enabled_,
+            t2m_.backend())) {
+        voc_runner_.clear_persistent_state();
+        voc_model_.voc_hg2_model_free();
+        models_loaded_ = false;
+        return false;
+    }
+    std::fprintf(
+        stderr,
+        "Token2Wav.load_models: Token2Mel->HiFT device bridge=%s\n",
+        device_bridge_enabled_ ? "enabled" : "disabled");
     models_loaded_    = true;
     return true;
 }
@@ -10735,6 +11298,7 @@ bool Token2Wav::start_stream_with_prompt_cache_gguf(const std::string & prompt_c
     voc_mel_cache_bct_.clear();
     voc_cache_source_bt1_.clear();
     voc_Tc_ = 0;
+    voc_mel_device_tail_frames_ = 0;
     voc_speech_cache_bt_.clear();
     voc_runner_.reset_session();
     token2wav_utils::ensure_hamming_window_2n((int64_t) kSourceCacheLen, voc_speech_window_);
@@ -10756,6 +11320,7 @@ bool Token2Wav::start_stream_with_prompt(const Token2Mel::PromptBundle & prompt,
     voc_mel_cache_bct_.clear();
     voc_cache_source_bt1_.clear();
     voc_Tc_ = 0;
+    voc_mel_device_tail_frames_ = 0;
     voc_speech_cache_bt_.clear();
     voc_runner_.reset_session();
     token2wav_utils::ensure_hamming_window_2n((int64_t) kSourceCacheLen, voc_speech_window_);
@@ -10808,10 +11373,17 @@ bool Token2Wav::push_tokens_window(const int32_t *      tokens,
     omni::e2e_trace::context_scope trace_scope(std::move(trace_context));
 
     std::vector<float> mel_bct;
+    borrowed_device_tensor device_mel;
     const auto         t_t2m0 = clock::now();
     {
         omni::e2e_trace::span trace("token2mel", "compute");
-        if (!t2m_.push_tokens(tokens, n_tokens, is_final, mel_bct)) {
+        const bool token2mel_ok =
+            device_bridge_enabled_
+                ? t2m_.push_tokens_device(
+                      tokens, n_tokens, is_final, device_mel)
+                : t2m_.push_tokens(
+                      tokens, n_tokens, is_final, mel_bct);
+        if (!token2mel_ok) {
             LOG_ERROR("Token2Wav.push_tokens_window: Token2Mel.push_tokens failed\n");
             return false;
         }
@@ -10819,7 +11391,8 @@ bool Token2Wav::push_tokens_window(const int32_t *      tokens,
     const auto   t_t2m1  = clock::now();
     const double t2m_ms  = std::chrono::duration<double, std::milli>(t_t2m1 - t_t2m0).count();
 
-    if (mel_bct.empty()) {
+    if ((!device_bridge_enabled_ && mel_bct.empty()) ||
+        (device_bridge_enabled_ && device_mel.contract.frames == 0)) {
         const double total_ms = std::chrono::duration<double, std::milli>(clock::now() - t_total0).count();
         omni::flow::profile::record_ms("token2mel", t2m_ms, is_first);
         omni::flow::profile::record_ms("vocoder", 0.0, is_first);
@@ -10832,15 +11405,32 @@ bool Token2Wav::push_tokens_window(const int32_t *      tokens,
         }
         return true;
     }
-    if (mel_bct.size() % (size_t) Token2Mel::kMelChannels != 0) {
+    if (!device_bridge_enabled_ &&
+        mel_bct.size() % (size_t) Token2Mel::kMelChannels != 0) {
         LOG_ERROR( "Token2Wav.push_tokens_window: invalid mel size (not divisible by 80)\n");
         return false;
     }
 
-    std::vector<float> mel_in_bct = voc_mel_cache_bct_;
-    Token2Mel::append_bct_along_time(mel_bct, 1, Token2Mel::kMelChannels, mel_in_bct);
-
-    const int64_t T_mel = (int64_t) mel_in_bct.size() / (int64_t) Token2Mel::kMelChannels;
+    std::vector<float> mel_in_bct;
+    int64_t T_mel = 0;
+    if (device_bridge_enabled_) {
+        if (!voc_mel_cache_bct_.empty()) {
+            LOG_ERROR(
+                "Token2Wav.push_tokens_window: device mel bridge found stale "
+                "host mel cache\n");
+            return false;
+        }
+        T_mel =
+            voc_mel_device_tail_frames_ +
+            device_mel.contract.frames;
+    } else {
+        mel_in_bct = voc_mel_cache_bct_;
+        Token2Mel::append_bct_along_time(
+            mel_bct, 1, Token2Mel::kMelChannels, mel_in_bct);
+        T_mel =
+            (int64_t) mel_in_bct.size() /
+            (int64_t) Token2Mel::kMelChannels;
+    }
 
     std::vector<float> out_source_bt1;
     int64_t            out_T_source = 0;
@@ -10856,7 +11446,8 @@ bool Token2Wav::push_tokens_window(const int32_t *      tokens,
                 out_T_audio,
                 out_source_bt1,
                 out_T_source,
-                is_final)) {
+                is_final,
+                device_bridge_enabled_ ? &device_mel : nullptr)) {
             LOG_ERROR( "Token2Wav.push_tokens_window: voc_hg2_runner_eval_stream failed\n");
             return false;
         }
@@ -10867,7 +11458,12 @@ bool Token2Wav::push_tokens_window(const int32_t *      tokens,
         token2wav_utils::fade_in_out_b1(wave_bt_out, voc_speech_cache_bt_, voc_speech_window_, (int64_t) kSourceCacheLen);
     }
 
-    {
+    if (device_bridge_enabled_) {
+        voc_mel_device_tail_frames_ =
+            std::min<int64_t>(
+                (int64_t) kMelCacheLen,
+                T_mel);
+    } else {
         const int64_t      C       = Token2Mel::kMelChannels;
         const int64_t      T_total = (int64_t) mel_in_bct.size() / C;
         std::vector<float> next_mel_cache;
@@ -10920,6 +11516,7 @@ void Token2Wav::reset_stream() {
     voc_mel_cache_bct_.clear();
     voc_cache_source_bt1_.clear();
     voc_Tc_ = 0;
+    voc_mel_device_tail_frames_ = 0;
     voc_speech_cache_bt_.clear();
     voc_speech_window_.clear();
     voc_runner_.reset_session();
