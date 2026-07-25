@@ -69,18 +69,27 @@ static void test_config() {
     omni::tts_device_head_config config;
     std::string error;
 
-    assert(omni::tts_device_head_parse_config(nullptr, nullptr, nullptr, config, error));
+    assert(omni::tts_device_head_parse_config(
+            nullptr, nullptr, nullptr, nullptr, config, error));
     assert(config.mode == omni::tts_head_mode::cpu);
     assert(!config.device_sampler);
+    assert(config.suppress_model_logits);
 
-    assert(omni::tts_device_head_parse_config("cann", "1", "1", config, error));
+    assert(omni::tts_device_head_parse_config(
+            "cann", "1", "1", "0", config, error));
     assert(config.mode == omni::tts_head_mode::cann);
     assert(config.device_sampler);
     assert(config.trace);
+    assert(!config.suppress_model_logits);
 
-    assert(!omni::tts_device_head_parse_config("cann", "0", nullptr, config, error));
+    assert(!omni::tts_device_head_parse_config(
+            "cann", "0", nullptr, nullptr, config, error));
     assert(!error.empty());
-    assert(!omni::tts_device_head_parse_config("bogus", nullptr, nullptr, config, error));
+    assert(!omni::tts_device_head_parse_config(
+            "bogus", nullptr, nullptr, nullptr, config, error));
+    assert(!omni::tts_device_head_parse_config(
+            "cann", "1", nullptr, "bogus", config, error));
+    assert(error == "OMNI_TTS_SUPPRESS_MODEL_LOGITS must be 0 or 1");
 }
 
 static void test_greedy_device_graph() {

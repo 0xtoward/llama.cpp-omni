@@ -55,6 +55,7 @@ bool tts_device_head_parse_config(
         const char * head,
         const char * device_sampler,
         const char * trace,
+        const char * suppress_model_logits,
         tts_device_head_config & config,
         std::string & error) {
     config = {};
@@ -76,6 +77,13 @@ bool tts_device_head_parse_config(
     }
     if (!parse_bool(trace, false, config.trace)) {
         error = "OMNI_TTS_TRACE must be 0 or 1";
+        return false;
+    }
+    if (!parse_bool(
+                suppress_model_logits,
+                true,
+                config.suppress_model_logits)) {
+        error = "OMNI_TTS_SUPPRESS_MODEL_LOGITS must be 0 or 1";
         return false;
     }
     if (config.mode == tts_head_mode::cann && !config.device_sampler) {

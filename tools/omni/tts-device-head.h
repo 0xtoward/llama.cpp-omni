@@ -18,12 +18,14 @@ struct tts_device_head_config {
     tts_head_mode mode = tts_head_mode::cpu;
     bool device_sampler = false;
     bool trace = false;
+    bool suppress_model_logits = true;
 };
 
 bool tts_device_head_parse_config(
         const char * head,
         const char * device_sampler,
         const char * trace,
+        const char * suppress_model_logits,
         tts_device_head_config & config,
         std::string & error);
 
