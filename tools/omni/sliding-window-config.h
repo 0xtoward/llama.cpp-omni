@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace omni::sliding_window {
 
@@ -11,6 +12,55 @@ namespace omni::sliding_window {
 // is deliberately fixed for the direct-test interface so an enabled window
 // cannot be configured right at the KV capacity boundary.
 inline constexpr int32_t k_context_reserve_tokens = 256;
+
+struct unit_fallback_batch {
+    std::vector<int> unit_ids;
+    int token_count = 0;
+};
+
+// Plan one contiguous KV compaction for the unit-level fallback used by turn
+// mode. Completed turns are handled before this helper is called, so fail
+// closed if a non-system entry does not belong to the current turn. A pending
+// unit is never included: it may already be writing KV but is not complete
+// enough to have a stable metadata length.
+template <typename UnitContainer>
+inline unit_fallback_batch plan_unit_fallback_batch(
+        const UnitContainer & units,
+        int current_turn_id,
+        int pending_unit_id,
+        int cache_len,
+        int low_water_tokens) {
+    unit_fallback_batch batch;
+    if (cache_len <= low_water_tokens) {
+        return batch;
+    }
+
+    const int tokens_needed = cache_len - low_water_tokens;
+    for (const auto & unit : units) {
+        if (unit.type == "system") {
+            continue;
+        }
+        if (unit.unit_id == pending_unit_id) {
+            break;
+        }
+        if (unit.turn_id != current_turn_id) {
+            // Preserve turn-first semantics. If an older completed turn is
+            // still present, the caller must resolve it as a turn rather than
+            // silently batching across the boundary here.
+            return {};
+        }
+        if (unit.length <= 0) {
+            continue;
+        }
+
+        batch.unit_ids.push_back(unit.unit_id);
+        batch.token_count += unit.length;
+        if (batch.token_count >= tokens_needed) {
+            break;
+        }
+    }
+    return batch;
+}
 
 inline bool parse_positive_int(
         const char * name,

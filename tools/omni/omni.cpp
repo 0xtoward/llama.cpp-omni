@@ -4110,6 +4110,74 @@ static bool sliding_window_drop_next_unit(struct omni_context * ctx_omni) {
 }
 
 /**
+ * Turn mode unit fallback: compact the oldest completed units of the current
+ * turn in one KV operation, stopping as soon as the low-water target is met.
+ *
+ * The pure planner enforces the protected system/current-pending/turn
+ * boundaries. Metadata is erased only after the single KV rm+shift succeeds.
+ *
+ * @return number of UnitEntry records removed; 0 means nothing was dropped
+ */
+static int sliding_window_drop_unit_batch_to_target(
+        struct omni_context * ctx_omni,
+        int low_water_tokens) {
+    if (!ctx_omni) {
+        return 0;
+    }
+
+    const auto batch = omni::sliding_window::plan_unit_fallback_batch(
+            ctx_omni->unit_history,
+            ctx_omni->current_turn_id,
+            ctx_omni->pending_unit_id,
+            get_cache_length(ctx_omni),
+            low_water_tokens);
+    if (batch.token_count <= 0 || batch.unit_ids.empty()) {
+        print_with_timestamp(
+                "[SW] drop_unit_batch: no safe current-turn units to drop "
+                "(turn_id=%d pending_unit_id=%d cache=%d low=%d units=%zu)\n",
+                ctx_omni->current_turn_id,
+                ctx_omni->pending_unit_id,
+                get_cache_length(ctx_omni),
+                low_water_tokens,
+                ctx_omni->unit_history.size());
+        return 0;
+    }
+
+    const int cache_before = get_cache_length(ctx_omni);
+    if (!sliding_window_drop_tokens_from_cache(ctx_omni, batch.token_count)) {
+        print_with_timestamp(
+                "[SW] drop_unit_batch: failed to drop %d tokens from %zu units\n",
+                batch.token_count,
+                batch.unit_ids.size());
+        return 0;
+    }
+
+    const auto should_remove = [&batch](const UnitEntry & entry) {
+        return std::find(
+                       batch.unit_ids.begin(),
+                       batch.unit_ids.end(),
+                       entry.unit_id) != batch.unit_ids.end();
+    };
+    ctx_omni->unit_history.erase(
+            std::remove_if(
+                    ctx_omni->unit_history.begin(),
+                    ctx_omni->unit_history.end(),
+                    should_remove),
+            ctx_omni->unit_history.end());
+
+    print_with_timestamp(
+            "[SW] 🗑️ BATCH-DROPPED %zu current-turn units, %d tokens | "
+            "cache %d -> %d, remaining_units=%zu, current_turn_id=%d\n",
+            batch.unit_ids.size(),
+            batch.token_count,
+            cache_before,
+            get_cache_length(ctx_omni),
+            ctx_omni->unit_history.size(),
+            ctx_omni->current_turn_id);
+    return static_cast<int>(batch.unit_ids.size());
+}
+
+/**
  * 执行滑动窗口策略
  * 当 cache 长度超过高水位线时，循环移除最早的 unit，直到降到低水位线以下
  * 
@@ -4170,9 +4238,11 @@ bool sliding_window_enforce(struct omni_context * ctx_omni) {
                 dropped_turns++;
                 dropped_units += units_before - (int)ctx_omni->unit_history.size();
                 dropped_one = true;
-            } else if (sliding_window_drop_next_unit(ctx_omni)) {
-                unit_fallbacks++;   // fallback 计数（turn 模式专属）
-                dropped_units++;    // 同时计入总量
+            } else if (const int n = sliding_window_drop_unit_batch_to_target(
+                               ctx_omni, cfg.low_water_tokens);
+                       n > 0) {
+                unit_fallbacks++;   // 一次批量 fallback（turn 模式专属）
+                dropped_units += n; // 实际移除的 UnitEntry 数
                 dropped_one = true;
             }
         } else {
