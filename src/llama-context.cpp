@@ -3810,6 +3810,16 @@ bool llama_get_embeddings_device_ith(
         llama_context * ctx,
         int32_t i,
         llama_device_tensor * out) {
+    // The returned tensor is consumed by an independently submitted backend
+    // graph (the MiniCPMTTS auxiliary head).  Unlike host getters, merely
+    // borrowing the device pointer does not otherwise establish a dependency
+    // between the producer scheduler stream and that consumer stream.
+    //
+    // Synchronize before publishing the pointer so the consumer cannot observe
+    // a partially-written or previous-step hidden row.  A producer event in
+    // llama_device_tensor can replace this full barrier once all backends can
+    // carry and wait on it.
+    ctx->synchronize();
     return ctx->get_embeddings_device_ith(i, out);
 }
 

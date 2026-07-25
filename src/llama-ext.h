@@ -142,8 +142,9 @@ LLAMA_API bool llama_set_output_contract(
         enum llama_output_contract contract);
 
 // Return a borrowed handle for one row of the latest device embedding output.
-// The returned metadata view and its graph-owned storage are valid only until
-// the context executes another graph. Passing -1 selects the final live row.
+// The producer context is synchronized before the handle is published. The
+// returned metadata view and its graph-owned storage are valid only until the
+// context executes another graph. Passing -1 selects the final live row.
 LLAMA_API bool llama_get_embeddings_device_ith(
         struct llama_context * ctx,
         int32_t i,
