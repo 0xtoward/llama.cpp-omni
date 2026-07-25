@@ -76,6 +76,7 @@ struct llama_context {
     bool memory_update(bool optimize);
 
     enum llama_pooling_type pooling_type() const;
+    bool output_contract_has_logits() const;
 
     float * get_logits();
     float * get_logits_ith(int32_t i);
@@ -113,6 +114,7 @@ struct llama_context {
     void set_embeddings (bool value);
     void set_embeddings_device_only(bool value);
     void set_logits_device_only(bool value);
+    bool set_output_contract(enum llama_output_contract contract);
     void set_embeddings_pre_norm(bool value, bool masked);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
@@ -293,6 +295,10 @@ private:
     // buffer. Device-side auxiliary heads may still consume other graph
     // outputs, such as the final embedding row.
     bool logits_device_only = false;
+
+    // Determines whether the graph includes the model vocabulary projection.
+    // This is part of the graph topology and must participate in reuse checks.
+    enum llama_output_contract output_contract = LLAMA_OUTPUT_DEFAULT;
 
     // Borrowed single-row view into the most recent device embedding output.
     // Its storage belongs to the graph tensor and remains valid only until the

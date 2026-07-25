@@ -56,6 +56,7 @@ bool tts_device_head_parse_config(
         const char * device_sampler,
         const char * trace,
         const char * suppress_model_logits,
+        const char * base_output,
         tts_device_head_config & config,
         std::string & error) {
     config = {};
@@ -86,12 +87,31 @@ bool tts_device_head_parse_config(
         error = "OMNI_TTS_SUPPRESS_MODEL_LOGITS must be 0 or 1";
         return false;
     }
+    const std::string output = base_output && base_output[0] ? base_output : "full";
+    if (output == "full") {
+        config.base_output = LLAMA_OUTPUT_DEFAULT;
+    } else if (output == "hidden_only") {
+        config.base_output = LLAMA_OUTPUT_HIDDEN_ONLY;
+    } else {
+        error = "OMNI_TTS_BASE_OUTPUT must be full or hidden_only";
+        return false;
+    }
     if (config.mode == tts_head_mode::cann && !config.device_sampler) {
         error = "OMNI_TTS_HEAD=cann requires OMNI_TTS_DEVICE_SAMPLER=1";
         return false;
     }
     if (config.mode == tts_head_mode::cpu && config.device_sampler) {
         error = "OMNI_TTS_DEVICE_SAMPLER=1 requires OMNI_TTS_HEAD=cann";
+        return false;
+    }
+    if (config.base_output == LLAMA_OUTPUT_HIDDEN_ONLY &&
+        config.mode != tts_head_mode::cann) {
+        error = "OMNI_TTS_BASE_OUTPUT=hidden_only requires OMNI_TTS_HEAD=cann";
+        return false;
+    }
+    if (config.base_output == LLAMA_OUTPUT_HIDDEN_ONLY &&
+        !config.suppress_model_logits) {
+        error = "OMNI_TTS_BASE_OUTPUT=hidden_only conflicts with OMNI_TTS_SUPPRESS_MODEL_LOGITS=0";
         return false;
     }
     return true;

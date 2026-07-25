@@ -2,6 +2,7 @@
 
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
+#include "src/llama-graph.h"
 
 #include <algorithm>
 #include <cassert>
@@ -70,26 +71,53 @@ static void test_config() {
     std::string error;
 
     assert(omni::tts_device_head_parse_config(
-            nullptr, nullptr, nullptr, nullptr, config, error));
+            nullptr, nullptr, nullptr, nullptr, nullptr, config, error));
     assert(config.mode == omni::tts_head_mode::cpu);
     assert(!config.device_sampler);
     assert(config.suppress_model_logits);
+    assert(config.base_output == LLAMA_OUTPUT_DEFAULT);
 
     assert(omni::tts_device_head_parse_config(
-            "cann", "1", "1", "0", config, error));
+            "cann", "1", "1", "0", "full", config, error));
     assert(config.mode == omni::tts_head_mode::cann);
     assert(config.device_sampler);
     assert(config.trace);
     assert(!config.suppress_model_logits);
+    assert(config.base_output == LLAMA_OUTPUT_DEFAULT);
+
+    assert(omni::tts_device_head_parse_config(
+            "cann", "1", "0", "1", "hidden_only", config, error));
+    assert(config.base_output == LLAMA_OUTPUT_HIDDEN_ONLY);
 
     assert(!omni::tts_device_head_parse_config(
-            "cann", "0", nullptr, nullptr, config, error));
+            "cann", "0", nullptr, nullptr, nullptr, config, error));
     assert(!error.empty());
     assert(!omni::tts_device_head_parse_config(
-            "bogus", nullptr, nullptr, nullptr, config, error));
+            "bogus", nullptr, nullptr, nullptr, nullptr, config, error));
     assert(!omni::tts_device_head_parse_config(
-            "cann", "1", nullptr, "bogus", config, error));
+            "cann", "1", nullptr, "bogus", nullptr, config, error));
     assert(error == "OMNI_TTS_SUPPRESS_MODEL_LOGITS must be 0 or 1");
+    assert(!omni::tts_device_head_parse_config(
+            "cann", "1", nullptr, nullptr, "bogus", config, error));
+    assert(error == "OMNI_TTS_BASE_OUTPUT must be full or hidden_only");
+    assert(!omni::tts_device_head_parse_config(
+            "cpu", "0", nullptr, nullptr, "hidden_only", config, error));
+    assert(error == "OMNI_TTS_BASE_OUTPUT=hidden_only requires OMNI_TTS_HEAD=cann");
+    assert(!omni::tts_device_head_parse_config(
+            "cann", "1", nullptr, "0", "hidden_only", config, error));
+    assert(error ==
+           "OMNI_TTS_BASE_OUTPUT=hidden_only conflicts with OMNI_TTS_SUPPRESS_MODEL_LOGITS=0");
+}
+
+static void test_output_contract_participates_in_graph_reuse() {
+    llm_graph_params full = {};
+    llm_graph_params hidden_only = {};
+    hidden_only.output_contract = LLAMA_OUTPUT_HIDDEN_ONLY;
+
+    assert(full.allow_reuse(full));
+    assert(hidden_only.allow_reuse(hidden_only));
+    assert(!full.allow_reuse(hidden_only));
+    assert(!hidden_only.allow_reuse(full));
 }
 
 static void test_greedy_device_graph() {
@@ -386,6 +414,7 @@ static void test_fixed_uniform_32_codes(bool apply_top_k_p) {
 
 int main() {
     test_config();
+    test_output_contract_participates_in_graph_reuse();
     test_greedy_device_graph();
     test_fixed_uniform_32_codes(/*apply_top_k_p=*/false);
     test_fixed_uniform_32_codes(/*apply_top_k_p=*/true);

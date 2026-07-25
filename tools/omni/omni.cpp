@@ -4376,6 +4376,7 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
     // auto ctx_omni = (struct omni_context *)malloc(sizeof(omni_context));
     auto ctx_omni = new omni_context();
     bool tts_suppress_model_logits = true;
+    enum llama_output_contract tts_output_contract = LLAMA_OUTPUT_DEFAULT;
 
     {
         omni::tts_device_head_config config;
@@ -4385,6 +4386,7 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
                     std::getenv("OMNI_TTS_DEVICE_SAMPLER"),
                     std::getenv("OMNI_TTS_TRACE"),
                     std::getenv("OMNI_TTS_SUPPRESS_MODEL_LOGITS"),
+                    std::getenv("OMNI_TTS_BASE_OUTPUT"),
                     config,
                     error)) {
             LOG_ERR("TTS device-head configuration failed: %s\n", error.c_str());
@@ -4394,9 +4396,17 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
         ctx_omni->tts_device_head_enabled = config.mode == omni::tts_head_mode::cann;
         ctx_omni->tts_device_head_trace = config.trace;
         tts_suppress_model_logits = config.suppress_model_logits;
+        tts_output_contract = config.base_output;
         LOG_INF(
-                "OMNI_TTS_SUPPRESS_MODEL_LOGITS resolved=%d\n",
+                "TTS base output: %s; suppress model logits: %d\n",
+                tts_output_contract == LLAMA_OUTPUT_HIDDEN_ONLY ?
+                        "hidden_only" : "full",
                 tts_suppress_model_logits ? 1 : 0);
+        if (tts_output_contract == LLAMA_OUTPUT_HIDDEN_ONLY && !use_tts) {
+            LOG_ERR("OMNI_TTS_BASE_OUTPUT=hidden_only requires TTS to be enabled\n");
+            delete ctx_omni;
+            return nullptr;
+        }
         if (ctx_omni->tts_device_head_enabled) {
             if (std::getenv("TTS_LOGITS_DEBUG_DIR") ||
                 std::getenv("TTS_OUTPUT_DIR") ||
@@ -4596,6 +4606,22 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             llama_set_embeddings_device_only(ctx_tts_llama, true);
             llama_set_logits_device_only(
                     ctx_tts_llama, tts_suppress_model_logits);
+            if (!llama_set_output_contract(
+                        ctx_tts_llama, tts_output_contract)) {
+                LOG_ERR(
+                        "%s: TTS model does not support output contract '%s'\n",
+                        __func__,
+                        tts_output_contract == LLAMA_OUTPUT_HIDDEN_ONLY ?
+                                "hidden_only" : "full");
+                llama_free(ctx_tts_llama);
+                llama_free_model(tts_model);
+                common_sampler_free(tts_sampler);
+                llama_free(ctx_llama);
+                llama_free_model(model);
+                common_sampler_free(sampler);
+                delete ctx_omni;
+                return nullptr;
+            }
         }
         
         // Load TTS weights from GGUF file

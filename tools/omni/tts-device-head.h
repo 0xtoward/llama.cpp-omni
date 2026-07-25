@@ -19,6 +19,7 @@ struct tts_device_head_config {
     bool device_sampler = false;
     bool trace = false;
     bool suppress_model_logits = true;
+    enum llama_output_contract base_output = LLAMA_OUTPUT_DEFAULT;
 };
 
 bool tts_device_head_parse_config(
@@ -26,6 +27,7 @@ bool tts_device_head_parse_config(
         const char * device_sampler,
         const char * trace,
         const char * suppress_model_logits,
+        const char * base_output,
         tts_device_head_config & config,
         std::string & error);
 

@@ -234,6 +234,12 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
     res->t_embd = cur;
 
     if constexpr (!embed) {
+        if (params.output_contract == LLAMA_OUTPUT_HIDDEN_ONLY) {
+            GGML_ASSERT(params.arch == LLM_ARCH_LLAMA);
+            ggml_build_forward_expand(gf, cur);
+            return;
+        }
+
         // lm_head
         cur = build_lora_mm(model.output, cur, model.output_s);
 

@@ -126,6 +126,21 @@ LLAMA_API void llama_set_embeddings_device_only(struct llama_context * ctx, bool
 // Host logits getters must not be used while this mode is active.
 LLAMA_API void llama_set_logits_device_only(struct llama_context * ctx, bool value);
 
+// Select which terminal tensors the model graph computes. Hidden-only is an
+// internal auxiliary-head contract: it is currently supported only by the
+// "llama" architecture and ends the graph at the final normalized embedding
+// instead of constructing the vocabulary projection.
+enum llama_output_contract {
+    LLAMA_OUTPUT_DEFAULT = 0,
+    LLAMA_OUTPUT_HIDDEN_ONLY,
+};
+
+// Returns false without changing the context when the requested contract is
+// invalid or unsupported by the loaded model architecture.
+LLAMA_API bool llama_set_output_contract(
+        struct llama_context * ctx,
+        enum llama_output_contract contract);
+
 // Return a borrowed handle for one row of the latest device embedding output.
 // The returned metadata view and its graph-owned storage are valid only until
 // the context executes another graph. Passing -1 selects the final live row.

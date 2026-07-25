@@ -787,7 +787,16 @@ enum llama_pooling_type llama_context::pooling_type() const {
     return cparams.pooling_type;
 }
 
+bool llama_context::output_contract_has_logits() const {
+    return output_contract == LLAMA_OUTPUT_DEFAULT;
+}
+
 float * llama_context::get_logits() {
+    if (output_contract == LLAMA_OUTPUT_HIDDEN_ONLY) {
+        LLAMA_LOG_ERROR("%s: logits are unavailable under the hidden-only output contract\n", __func__);
+        return nullptr;
+    }
+
     output_reorder();
 
     return logits.data;
@@ -823,6 +832,11 @@ int64_t llama_context::output_resolve_row(int32_t i) const {
 }
 
 float * llama_context::get_logits_ith(int32_t i) {
+    if (output_contract == LLAMA_OUTPUT_HIDDEN_ONLY) {
+        LLAMA_LOG_ERROR("%s: logits are unavailable under the hidden-only output contract\n", __func__);
+        return nullptr;
+    }
+
     output_reorder();
 
     try {
@@ -1035,6 +1049,11 @@ float * llama_context::get_sampled_probs_ith(int32_t idx) {
 }
 
 float * llama_context::get_sampled_logits_ith(int32_t idx) {
+    if (output_contract == LLAMA_OUTPUT_HIDDEN_ONLY) {
+        LLAMA_LOG_ERROR("%s: logits are unavailable under the hidden-only output contract\n", __func__);
+        return nullptr;
+    }
+
     output_reorder();
 
     if (!sampling.logits.has_data()) {
@@ -1189,6 +1208,36 @@ void llama_context::set_embeddings_device_only(bool value) {
 void llama_context::set_logits_device_only(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
     logits_device_only = value;
+}
+
+bool llama_context::set_output_contract(enum llama_output_contract contract) {
+    if (contract != LLAMA_OUTPUT_DEFAULT &&
+        contract != LLAMA_OUTPUT_HIDDEN_ONLY) {
+        LLAMA_LOG_ERROR("%s: invalid output contract: %d\n", __func__, (int) contract);
+        return false;
+    }
+    if (contract == LLAMA_OUTPUT_HIDDEN_ONLY && model.arch != LLM_ARCH_LLAMA) {
+        LLAMA_LOG_ERROR(
+                "%s: hidden-only output requires architecture 'llama', got '%s'\n",
+                __func__, llm_arch_name(model.arch));
+        return false;
+    }
+    if (output_contract == contract) {
+        return true;
+    }
+
+    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, (int) contract);
+    synchronize();
+    const auto previous_contract = output_contract;
+    output_contract = contract;
+    if (output_reserve(cparams.n_seq_max) < cparams.n_seq_max) {
+        LLAMA_LOG_ERROR("%s: failed to reconfigure output buffers\n", __func__);
+        output_contract = previous_contract;
+        (void) output_reserve(cparams.n_seq_max);
+        return false;
+    }
+    sched_need_reserve = true;
+    return true;
 }
 
 void llama_context::set_embeddings_pre_norm(bool value, bool masked) {
@@ -2106,7 +2155,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const auto n_embd     = hparams.n_embd;
     const auto n_embd_out = hparams.n_embd_out();
 
-    bool has_logits        = true;
+    bool has_logits        = output_contract == LLAMA_OUTPUT_DEFAULT;
     bool has_embd          = cparams.embeddings;
     bool has_embd_pre_norm = cparams.embeddings_pre_norm;
 
@@ -2381,6 +2430,7 @@ llm_graph_params llama_context::graph_params(
                           llm_graph_type   gtype) const {
     return {
         /*.arch        =*/ model.arch,
+        /*.output_contract =*/ output_contract,
         /*.hparams     =*/ model.hparams,
         /*.cparams     =*/ cparams,
         /*.ubatch      =*/ ubatch,
@@ -3649,6 +3699,12 @@ void llama_set_logits_device_only(llama_context * ctx, bool value) {
     ctx->set_logits_device_only(value);
 }
 
+bool llama_set_output_contract(
+        llama_context * ctx,
+        enum llama_output_contract contract) {
+    return ctx->set_output_contract(contract);
+}
+
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
     ctx->set_causal_attn(causal_attn);
 }
@@ -3669,6 +3725,10 @@ float * llama_get_logits(llama_context * ctx) {
 
 float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
+
+    if (!ctx->output_contract_has_logits()) {
+        return ctx->get_logits_ith(i);
+    }
 
     float * res = nullptr;
 

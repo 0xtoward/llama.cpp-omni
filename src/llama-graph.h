@@ -2,6 +2,7 @@
 
 #include "llama-arch.h"
 #include "llama-batch.h"
+#include "llama-ext.h"
 #include "llama-hparams.h"
 #include "llama-adapter.h"
 
@@ -587,6 +588,8 @@ class llm_graph_result;
 struct llm_graph_params {
     llm_arch arch = LLM_ARCH_UNKNOWN;
 
+    enum llama_output_contract output_contract = LLAMA_OUTPUT_DEFAULT;
+
     llama_hparams hparams;
     llama_cparams cparams;
 
@@ -687,6 +690,7 @@ struct llm_graph_params {
         return
             cparams.embeddings  == other.cparams.embeddings  &&
             cparams.causal_attn == other.cparams.causal_attn &&
+            output_contract == other.output_contract &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
