@@ -5,6 +5,7 @@
 #include "token2wav/token2wav-impl.h"
 #include "token2wav/token2wav-backend-policy.h"
 #include "sampling-policy.h"
+#include "sliding-window-config.h"
 #include "token-trace.h"
 #include "e2e-trace.h"
 #include "tts-device-head.h"
@@ -4604,6 +4605,36 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
     ctx_omni->ctx_llama = ctx_llama;
     ctx_omni->model = model;
     ctx_omni->ctx_sampler = sampler;
+
+    {
+        std::string error;
+        const int32_t n_ctx = static_cast<int32_t>(llama_n_ctx(ctx_llama));
+        if (!omni::sliding_window::parse_env(
+                    std::getenv("OMNI_SLIDING_WINDOW_MODE"),
+                    std::getenv("OMNI_SLIDING_WINDOW_HIGH"),
+                    std::getenv("OMNI_SLIDING_WINDOW_LOW"),
+                    n_ctx,
+                    ctx_omni->sliding_window_config.mode,
+                    ctx_omni->sliding_window_config.high_water_tokens,
+                    ctx_omni->sliding_window_config.low_water_tokens,
+                    error)) {
+            LOG_ERR("sliding-window configuration failed: %s\n", error.c_str());
+            common_sampler_free(sampler);
+            if (ctx_omni->owns_model) {
+                llama_free(ctx_llama);
+                llama_free_model(model);
+            }
+            delete ctx_omni;
+            return nullptr;
+        }
+        LOG_INF(
+                "Sliding window: mode=%s high=%d low=%d n_ctx=%d reserve=%d\n",
+                ctx_omni->sliding_window_config.mode.c_str(),
+                ctx_omni->sliding_window_config.high_water_tokens,
+                ctx_omni->sliding_window_config.low_water_tokens,
+                n_ctx,
+                omni::sliding_window::k_context_reserve_tokens);
+    }
 
     if (use_tts && !params->tts_model.empty()) {
         print_with_timestamp("=== omni_init: loading TTS model\n");

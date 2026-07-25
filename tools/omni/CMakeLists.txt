@@ -16,6 +16,7 @@ add_library(omni
             tts-condition-graph.h
             tts-device-head.cpp
             tts-device-head.h
+            sliding-window-config.h
             audition.cpp
             audition.h
             vision.cpp
@@ -301,6 +302,19 @@ if (LLAMA_BUILD_TESTS)
         COMMAND test-omni-token-trace
     )
     set_tests_properties(omni-token-trace PROPERTIES LABELS "main;omni")
+
+    add_executable(
+        test-omni-sliding-window-config
+        test/test-sliding-window-config.cpp)
+    target_include_directories(
+        test-omni-sliding-window-config PRIVATE .)
+    target_compile_features(
+        test-omni-sliding-window-config PRIVATE cxx_std_17)
+    add_test(
+        NAME omni-sliding-window-config
+        COMMAND test-omni-sliding-window-config)
+    set_tests_properties(
+        omni-sliding-window-config PROPERTIES LABELS "main;omni")
 
     add_test(
         NAME voxcpm2-cli-smoke
