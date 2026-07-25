@@ -49,6 +49,90 @@ bool backend_is_cann(ggml_backend_t backend) {
     return normalized.find("cann") != std::string::npos;
 }
 
+bool hidden_fingerprint_enabled() {
+    const char * value = std::getenv("OMNI_TTS_HIDDEN_FINGERPRINT");
+    return value && std::strcmp(value, "1") == 0;
+}
+
+void record_hidden_fingerprint(
+        ggml_backend_t backend,
+        ggml_tensor * hidden,
+        const tts_device_head_step & step,
+        tts_device_head_transfer_stats & transfer) {
+    if (!hidden_fingerprint_enabled()) {
+        return;
+    }
+
+    const int64_t count = ggml_nelements(hidden);
+    std::vector<float> values(count);
+    ggml_backend_tensor_get(
+            hidden,
+            values.data(), 0,
+            values.size() * sizeof(values[0]));
+    const uint64_t bytes = values.size() * sizeof(values[0]);
+    transfer.d2h_bytes += bytes;
+    transfer.hidden_d2h_bytes += bytes;
+    transfer.diagnostic_d2h_bytes += bytes;
+
+    uint64_t hash = UINT64_C(14695981039346656037);
+    const auto * raw =
+            reinterpret_cast<const uint8_t *>(values.data());
+    for (uint64_t i = 0; i < bytes; ++i) {
+        hash ^= raw[i];
+        hash *= UINT64_C(1099511628211);
+    }
+
+    double sum = 0.0;
+    double sum_sq = 0.0;
+    float min_value = std::numeric_limits<float>::infinity();
+    float max_value = -std::numeric_limits<float>::infinity();
+    int64_t finite_count = 0;
+    int64_t nan_count = 0;
+    int64_t inf_count = 0;
+    for (float value : values) {
+        if (std::isnan(value)) {
+            ++nan_count;
+            continue;
+        }
+        if (!std::isfinite(value)) {
+            ++inf_count;
+            continue;
+        }
+        ++finite_count;
+        min_value = std::min(min_value, value);
+        max_value = std::max(max_value, value);
+        sum += value;
+        sum_sq += static_cast<double>(value) * value;
+    }
+    const double mean =
+            finite_count ? sum / finite_count : 0.0;
+    const double variance =
+            finite_count ?
+                    std::max(0.0, sum_sq / finite_count - mean * mean) :
+                    0.0;
+    const auto trace_ids = e2e_trace::current_context();
+    LOG_INF(
+            "TTS_HIDDEN_FINGERPRINT step=%d chunk=%lld n_past=%d "
+            "shape=[%lld] dtype=f32 backend=%s hash=fnv1a64:%016llx "
+            "min=%.9g max=%.9g mean=%.12g std=%.12g l2=%.12g "
+            "finite=%lld nan=%lld inf=%lld diagnostic_d2h_bytes=%llu\n",
+            step.token_index,
+            static_cast<long long>(trace_ids.chunk_id),
+            step.n_past,
+            static_cast<long long>(count),
+            ggml_backend_name(backend),
+            static_cast<unsigned long long>(hash),
+            min_value,
+            max_value,
+            mean,
+            std::sqrt(variance),
+            std::sqrt(sum_sq),
+            static_cast<long long>(finite_count),
+            static_cast<long long>(nan_count),
+            static_cast<long long>(inf_count),
+            static_cast<unsigned long long>(bytes));
+}
+
 } // namespace
 
 bool tts_device_head_parse_config(
@@ -318,6 +402,10 @@ struct tts_device_head::impl {
     ggml_tensor * candidate_order = nullptr;
     ggml_tensor * sampled = nullptr;
     ggml_tensor * embedding = nullptr;
+    ggml_tensor * burst_uniforms = nullptr;
+    ggml_tensor * burst_tokens = nullptr;
+    std::array<ggml_tensor *, 4> burst_uniform_views = {};
+    std::array<ggml_tensor *, 4> burst_token_views = {};
     ggml_cgraph * graph = nullptr;
 
     llama_sampler * sampler = nullptr;
@@ -331,6 +419,9 @@ struct tts_device_head::impl {
     bool greedy = false;
     bool apply_top_k_p = false;
     bool trace = false;
+    bool burst_active = false;
+    uint64_t burst_epoch = 0;
+    int32_t burst_next_slot = 0;
     tts_device_head_transfer_stats last_transfer;
 
     ~impl() {
@@ -460,7 +551,7 @@ bool tts_device_head::initialize(
 
     ggml_context * ctx = pimpl->compute_ctx.get();
     pimpl->input_ctx.reset(ggml_init({
-        /*.mem_size   =*/ 16 * ggml_tensor_overhead(),
+        /*.mem_size   =*/ 32 * ggml_tensor_overhead(),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     }));
@@ -473,6 +564,20 @@ bool tts_device_head::initialize(
     pimpl->hidden_input = ggml_new_tensor_2d(
             input_ctx, GGML_TYPE_F32, hidden_size, 1);
     ggml_set_input(pimpl->hidden_input);
+    pimpl->burst_uniforms =
+            ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, 4);
+    pimpl->burst_tokens =
+            ggml_new_tensor_1d(input_ctx, GGML_TYPE_I32, 4);
+    ggml_set_name(pimpl->burst_uniforms, "tts_burst_uniforms");
+    ggml_set_name(pimpl->burst_tokens, "tts_burst_token_ring");
+    for (int32_t i = 0; i < 4; ++i) {
+        pimpl->burst_uniform_views[i] = ggml_view_1d(
+                input_ctx, pimpl->burst_uniforms, 1,
+                static_cast<size_t>(i) * sizeof(float));
+        pimpl->burst_token_views[i] = ggml_view_1d(
+                input_ctx, pimpl->burst_tokens, 1,
+                static_cast<size_t>(i) * sizeof(int32_t));
+    }
 
     ggml_tensor * logits = ggml_mul_mat(ctx, pimpl->head_weight, pimpl->hidden_input);
     pimpl->head_logits = logits;
@@ -718,6 +823,24 @@ bool tts_device_head::forward(
         int32_t & selected_relative_token,
         llama_device_tensor & selected_embedding,
         std::string & error) {
+    return forward_impl(
+            hidden,
+            step,
+            /*defer_token=*/false,
+            /*burst_slot=*/-1,
+            selected_relative_token,
+            selected_embedding,
+            error);
+}
+
+bool tts_device_head::forward_impl(
+        const llama_device_tensor & hidden,
+        const tts_device_head_step & step,
+        bool defer_token,
+        int32_t burst_slot,
+        int32_t & selected_relative_token,
+        llama_device_tensor & selected_embedding,
+        std::string & error) {
     error.clear();
     selected_relative_token = -1;
     selected_embedding = {};
@@ -740,6 +863,8 @@ bool tts_device_head::forward(
         error = "stochastic TTS device head requires a finite uniform in [0,1)";
         return false;
     }
+    record_hidden_fingerprint(
+            source_backend, source, step, pimpl->last_transfer);
 
     std::map<int32_t, int32_t> frequencies;
     if (!step.skip_repetition) {
@@ -801,9 +926,20 @@ bool tts_device_head::forward(
         ggml_backend_tensor_set(pimpl->penalty_neg, neg.data(), 0, neg_bytes);
         ggml_backend_tensor_set(pimpl->penalty_pos, pos.data(), 0, pos_bytes);
         ggml_backend_tensor_set(pimpl->eos_bias, &eos_bias, 0, sizeof(eos_bias));
-        ggml_backend_tensor_set(pimpl->uniform, &step.uniform, 0, sizeof(step.uniform));
+        if (defer_token) {
+            ggml_backend_tensor_copy_async(
+                    pimpl->backend,
+                    pimpl->backend,
+                    pimpl->burst_uniform_views[burst_slot],
+                    pimpl->uniform);
+            pimpl->last_transfer.d2d_bytes += sizeof(step.uniform);
+        } else {
+            ggml_backend_tensor_set(
+                    pimpl->uniform, &step.uniform, 0, sizeof(step.uniform));
+            pimpl->last_transfer.h2d_bytes += sizeof(step.uniform);
+        }
         pimpl->last_transfer.h2d_bytes += ids_bytes + neg_bytes + pos_bytes +
-                sizeof(eos_bias) + sizeof(step.uniform);
+                sizeof(eos_bias);
     }
 
     const auto start = std::chrono::steady_clock::now();
@@ -816,13 +952,20 @@ bool tts_device_head::forward(
             error = "TTS device head graph compute failed";
             return false;
         }
-        ggml_backend_tensor_get_async(
-                pimpl->backend, pimpl->sampled,
-                &selected_relative_token, 0, sizeof(selected_relative_token));
-        pimpl->last_transfer.d2h_bytes += sizeof(selected_relative_token);
-        pimpl->last_transfer.control_scalar_d2h_bytes +=
-                sizeof(selected_relative_token);
-        {
+        if (defer_token) {
+            ggml_backend_tensor_copy_async(
+                    pimpl->backend,
+                    pimpl->backend,
+                    pimpl->sampled,
+                    pimpl->burst_token_views[burst_slot]);
+            pimpl->last_transfer.d2d_bytes += sizeof(selected_relative_token);
+        } else {
+            ggml_backend_tensor_get_async(
+                    pimpl->backend, pimpl->sampled,
+                    &selected_relative_token, 0, sizeof(selected_relative_token));
+            pimpl->last_transfer.d2h_bytes += sizeof(selected_relative_token);
+            pimpl->last_transfer.control_scalar_d2h_bytes +=
+                    sizeof(selected_relative_token);
             e2e_trace::span scalar_sync_trace(
                 "tts", "token_scalar_sync", ggml_backend_name(pimpl->backend));
             ggml_backend_synchronize(pimpl->backend);
@@ -830,11 +973,13 @@ bool tts_device_head::forward(
     }
     const auto stop = std::chrono::steady_clock::now();
 
-    if (selected_relative_token < 0 || selected_relative_token >= pimpl->vocab_size) {
+    if (!defer_token &&
+        (selected_relative_token < 0 ||
+         selected_relative_token >= pimpl->vocab_size)) {
         error = "TTS device sampler produced out-of-range token";
         return false;
     }
-    if (std::getenv("OMNI_TTS_DEBUG_DUMP") && !pimpl->greedy) {
+    if (!defer_token && std::getenv("OMNI_TTS_DEBUG_DUMP") && !pimpl->greedy) {
         const int64_t n = ggml_nelements(pimpl->sample_probs);
         std::vector<float> probs(n);
         std::vector<float> cdf(n);
@@ -967,10 +1112,11 @@ bool tts_device_head::forward(
             "device_sampler",
             "host_control",
             "[1]",
-            "device_to_host",
-            "required_control_scalar",
+            defer_token ? "device_to_device" : "device_to_host",
+            defer_token ? "deferred_control_ring" :
+                          "required_control_scalar",
             pimpl->sampled,
-            sizeof(selected_relative_token));
+            defer_token ? 0 : sizeof(selected_relative_token));
     }
     if (pimpl->trace) {
         const double elapsed_us = std::chrono::duration<double, std::micro>(
@@ -994,6 +1140,135 @@ bool tts_device_head::forward(
     return true;
 }
 
+bool tts_device_head::begin_burst(
+        uint64_t epoch,
+        const std::array<float, 4> & uniforms,
+        std::string & error) {
+    error.clear();
+    if (!initialized()) {
+        error = "TTS device head is not initialized";
+        return false;
+    }
+    if (pimpl->burst_active) {
+        error = "TTS device burst is already active";
+        return false;
+    }
+    if (!pimpl->greedy) {
+        for (float uniform : uniforms) {
+            if (!std::isfinite(uniform) || uniform < 0.0f ||
+                uniform >= 1.0f) {
+                error = "TTS device burst uniforms must be finite in [0,1)";
+                return false;
+            }
+        }
+        ggml_backend_tensor_set(
+                pimpl->burst_uniforms,
+                uniforms.data(), 0,
+                uniforms.size() * sizeof(uniforms[0]));
+    }
+    pimpl->burst_active = true;
+    pimpl->burst_epoch = epoch;
+    pimpl->burst_next_slot = 0;
+    return true;
+}
+
+bool tts_device_head::forward_burst_step(
+        uint64_t epoch,
+        const llama_device_tensor & hidden,
+        const tts_device_head_step & step,
+        llama_device_tensor & selected_embedding,
+        std::string & error) {
+    if (!pimpl->burst_active || epoch != pimpl->burst_epoch) {
+        error = "TTS device burst step rejected inactive or stale epoch";
+        return false;
+    }
+    if (pimpl->burst_next_slot >= 4) {
+        error = "TTS device burst already contains four steps";
+        return false;
+    }
+    if (!pimpl->greedy && !step.skip_repetition) {
+        error =
+                "exact stochastic burst requires device-side repetition history; "
+                "current no-D2H primitive only accepts skip_repetition";
+        return false;
+    }
+    int32_t ignored_token = -1;
+    const int32_t slot = pimpl->burst_next_slot;
+    if (!forward_impl(
+                hidden,
+                step,
+                /*defer_token=*/true,
+                slot,
+                ignored_token,
+                selected_embedding,
+                error)) {
+        return false;
+    }
+    ++pimpl->burst_next_slot;
+    return true;
+}
+
+bool tts_device_head::finish_burst(
+        uint64_t epoch,
+        tts_device_burst_event & event,
+        std::string & error) {
+    error.clear();
+    if (!pimpl->burst_active || epoch != pimpl->burst_epoch) {
+        error = "TTS device burst finish rejected inactive or stale epoch";
+        return false;
+    }
+    if (pimpl->burst_next_slot != 4) {
+        error = "TTS device burst finish requires four queued steps";
+        return false;
+    }
+
+    event = {};
+    event.epoch = epoch;
+    event.valid_count = 4;
+    ggml_backend_tensor_get_async(
+            pimpl->backend,
+            pimpl->burst_tokens,
+            event.tokens.data(), 0,
+            event.tokens.size() * sizeof(event.tokens[0]));
+    pimpl->last_transfer.d2h_bytes +=
+            event.tokens.size() * sizeof(event.tokens[0]);
+    pimpl->last_transfer.control_scalar_d2h_bytes +=
+            event.tokens.size() * sizeof(event.tokens[0]);
+    ggml_backend_synchronize(pimpl->backend);
+
+    int32_t first_stop = 4;
+    for (int32_t i = 0; i < 4; ++i) {
+        if (event.tokens[i] < 0 ||
+            event.tokens[i] >= pimpl->vocab_size) {
+            error = "TTS device burst ring contains an out-of-range token";
+            pimpl->burst_active = false;
+            return false;
+        }
+        event.stops[i] =
+                event.tokens[i] == pimpl->vocab_size - 1 ? 1 : 0;
+        if (event.stops[i] && first_stop == 4) {
+            first_stop = i;
+        }
+    }
+    event.accepted_count = first_stop;
+    event.kv_rollback_count = 4 - first_stop;
+    pimpl->burst_active = false;
+    pimpl->burst_next_slot = 0;
+    return true;
+}
+
+void tts_device_head::cancel_burst(uint64_t next_epoch) {
+    if (!pimpl) {
+        return;
+    }
+    if (pimpl->backend) {
+        ggml_backend_synchronize(pimpl->backend);
+    }
+    pimpl->burst_active = false;
+    pimpl->burst_epoch = next_epoch;
+    pimpl->burst_next_slot = 0;
+}
+
 void tts_device_head::reset() {
     pimpl.reset(new impl());
 }
@@ -1004,6 +1279,29 @@ bool tts_device_head::initialized() const {
 
 tts_device_head_transfer_stats tts_device_head::last_transfer_stats() const {
     return pimpl ? pimpl->last_transfer : tts_device_head_transfer_stats{};
+}
+
+bool tts_device_burst_rollback_kv(
+        int32_t & n_past,
+        int32_t rollback_count,
+        const std::function<bool(int32_t, int32_t)> & remove_suffix,
+        std::string & error) {
+    error.clear();
+    if (rollback_count < 0 || rollback_count > n_past) {
+        error = "invalid TTS KV rollback range";
+        return false;
+    }
+    if (rollback_count == 0) {
+        return true;
+    }
+    const int32_t old_n_past = n_past;
+    const int32_t new_n_past = old_n_past - rollback_count;
+    if (!remove_suffix || !remove_suffix(new_n_past, old_n_past)) {
+        error = "llama_memory_seq_rm rejected the TTS KV suffix";
+        return false;
+    }
+    n_past = new_n_past;
+    return true;
 }
 
 } // namespace omni

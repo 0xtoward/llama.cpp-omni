@@ -3022,6 +3022,8 @@ static llama_token sample_tts_token_device(
     omni::tts_device_head_step step;
     step.skip_repetition = greedy || skip_processors;
     step.force_no_eos = !greedy && force_no_eos;
+    step.token_index = token_index_in_chunk;
+    step.n_past = n_past_tts ? *n_past_tts : -1;
     if (tokens_for_penalty) {
         step.recent_relative_tokens.reserve(tokens_for_penalty->size());
         for (llama_token token : *tokens_for_penalty) {
@@ -3075,6 +3077,36 @@ static llama_token sample_tts_token_device(
         return 0;
     }
     return id;
+}
+
+// Compiled integration point for speculative TTS suffix rollback.  The
+// MiniCPMTTS model uses the regular attention KV cache, whose seq_rm
+// implementation supports removing a tail interval.  Burst4 remains disabled
+// until exact device-side repetition history is available, but the rollback
+// call chain itself is kept concrete and fail-closed:
+// llama_get_memory -> llama_memory_seq_rm(seq=0, [new, old)) -> n_past update.
+[[maybe_unused]] static bool rollback_tts_device_burst_suffix(
+        struct omni_context * ctx_omni,
+        int32_t & n_past_tts,
+        int32_t rollback_count,
+        std::string & error) {
+    if (!ctx_omni || !ctx_omni->ctx_tts_llama) {
+        error = "TTS KV rollback requires an initialized MiniCPMTTS context";
+        return false;
+    }
+    llama_memory_t memory =
+            llama_get_memory(ctx_omni->ctx_tts_llama);
+    if (!memory) {
+        error = "TTS KV rollback could not acquire llama memory";
+        return false;
+    }
+    return omni::tts_device_burst_rollback_kv(
+            n_past_tts,
+            rollback_count,
+            [memory](int32_t p0, int32_t p1) {
+                return llama_memory_seq_rm(memory, 0, p0, p1);
+            },
+            error);
 }
 
 static bool tts_code_weights_ready(const struct omni_context * ctx_omni) {
@@ -4379,6 +4411,20 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
     enum llama_output_contract tts_output_contract = LLAMA_OUTPUT_DEFAULT;
 
     {
+        const char * hidden_fp =
+                std::getenv("OMNI_TTS_HIDDEN_FINGERPRINT");
+        if (hidden_fp && std::strcmp(hidden_fp, "0") != 0 &&
+            std::strcmp(hidden_fp, "1") != 0) {
+            LOG_ERR("OMNI_TTS_HIDDEN_FINGERPRINT must be 0 or 1\n");
+            delete ctx_omni;
+            return nullptr;
+        }
+        if (hidden_fp && std::strcmp(hidden_fp, "1") == 0) {
+            LOG_WRN(
+                    "OMNI_TTS_HIDDEN_FINGERPRINT=1 copies every 768-value "
+                    "TTS hidden to Host; diagnostic run only, performance "
+                    "numbers are invalid\n");
+        }
         omni::tts_device_head_config config;
         std::string error;
         if (!omni::tts_device_head_parse_config(

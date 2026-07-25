@@ -4,6 +4,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -96,6 +97,9 @@ struct tts_device_head_step {
     // CPU and device sampling replayable without copying logits to the host.
     bool has_uniform = false;
     float uniform = 0.0f;
+    // Diagnostic identity only.  These values never participate in sampling.
+    int32_t token_index = -1;
+    int32_t n_past = -1;
 };
 
 // Transfer ledger for one forward() call.  Initialization-time weight uploads
@@ -163,13 +167,50 @@ public:
             llama_device_tensor & selected_embedding,
             std::string & error);
 
+    // Capability primitive for a true four-code device burst.  Uniforms are
+    // uploaded once; four head graphs enqueue without token D2H; finish_burst
+    // reads the compact token ring once.  Until exact device-side repetition
+    // state exists, stochastic steps must set skip_repetition=true.
+    bool begin_burst(
+            uint64_t epoch,
+            const std::array<float, 4> & uniforms,
+            std::string & error);
+    bool forward_burst_step(
+            uint64_t epoch,
+            const llama_device_tensor & hidden,
+            const tts_device_head_step & step,
+            llama_device_tensor & selected_embedding,
+            std::string & error);
+    bool finish_burst(
+            uint64_t epoch,
+            tts_device_burst_event & event,
+            std::string & error);
+    void cancel_burst(uint64_t next_epoch);
+
     void reset();
     bool initialized() const;
     tts_device_head_transfer_stats last_transfer_stats() const;
 
 private:
+    bool forward_impl(
+            const llama_device_tensor & hidden,
+            const tts_device_head_step & step,
+            bool defer_token,
+            int32_t burst_slot,
+            int32_t & selected_relative_token,
+            llama_device_tensor & selected_embedding,
+            std::string & error);
+
     struct impl;
     std::unique_ptr<impl> pimpl;
 };
+
+// Shared, unit-testable contract used by the service after a speculative
+// burst.  remove_suffix must remove [new_n_past, old_n_past) from sequence 0.
+bool tts_device_burst_rollback_kv(
+        int32_t & n_past,
+        int32_t rollback_count,
+        const std::function<bool(int32_t, int32_t)> & remove_suffix,
+        std::string & error);
 
 } // namespace omni

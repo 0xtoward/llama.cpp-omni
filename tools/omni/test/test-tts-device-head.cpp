@@ -284,6 +284,17 @@ static void test_greedy_device_graph() {
         assert(std::fabs(got[d] - (30.0f + d)) < 1e-6f);
     }
 
+    assert(setenv("OMNI_TTS_HIDDEN_FINGERPRINT", "1", 1) == 0);
+    step.token_index = 7;
+    step.n_past = 31;
+    assert(runner.forward(hidden, step, token, selected_embedding, error));
+    const auto diagnostic_stats = runner.last_transfer_stats();
+    assert(diagnostic_stats.hidden_d2h_bytes == sizeof(hidden_data));
+    assert(diagnostic_stats.diagnostic_d2h_bytes == sizeof(hidden_data));
+    assert(diagnostic_stats.d2h_bytes ==
+           sizeof(hidden_data) + sizeof(int32_t));
+    assert(unsetenv("OMNI_TTS_HIDDEN_FINGERPRINT") == 0);
+
     runner.reset();
     hidden_buffer.reset();
     hidden_ctx.reset();
@@ -514,6 +525,165 @@ static void test_fixed_uniform_32_codes(bool apply_top_k_p) {
     ggml_backend_free(backend);
 }
 
+static void test_no_d2h_four_step_primitive() {
+    constexpr int hidden_size = 4;
+    constexpr int vocab_size = 16;
+    constexpr float temperature = 0.8f;
+
+    ggml_backend_t backend = init_test_backend();
+    assert(backend != nullptr);
+    ggml_context_ptr hidden_ctx(ggml_init({
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    }));
+    ggml_tensor * hidden_tensor =
+            ggml_new_tensor_2d(
+                    hidden_ctx.get(), GGML_TYPE_F32, hidden_size, 1);
+    ggml_backend_buffer_ptr hidden_buffer(
+            ggml_backend_alloc_ctx_tensors(hidden_ctx.get(), backend));
+    assert(hidden_buffer);
+    const float hidden_data[hidden_size] = {
+        0.125f, -0.75f, 1.5f, 0.625f,
+    };
+    ggml_backend_tensor_set(
+            hidden_tensor, hidden_data, 0, sizeof(hidden_data));
+
+    std::vector<float> head(hidden_size * vocab_size);
+    std::vector<float> emb(hidden_size * vocab_size);
+    std::vector<float> logits(vocab_size, 0.0f);
+    for (int token = 0; token < vocab_size; ++token) {
+        for (int d = 0; d < hidden_size; ++d) {
+            const float value =
+                    std::cos((token + 2) * (d + 1) * 0.19f) +
+                    0.017f * token;
+            head[token * hidden_size + d] = value;
+            emb[token * hidden_size + d] = token + 0.01f * d;
+            logits[token] += value * hidden_data[d];
+        }
+    }
+
+    llama_device_tensor hidden = {};
+    hidden.tensor = hidden_tensor;
+    hidden.backend = backend;
+    hidden.type = GGML_TYPE_F32;
+    hidden.ne[0] = hidden_size;
+    hidden.ne[1] = 1;
+
+    omni::tts_device_head runner;
+    std::string error;
+    assert(runner.initialize(
+            hidden,
+            head.data(),
+            emb.data(),
+            hidden_size,
+            vocab_size,
+            temperature,
+            /*top_p=*/0.85f,
+            /*top_k=*/8,
+            /*min_keep=*/3,
+            /*repetition_penalty=*/1.05f,
+            /*repetition_window=*/8,
+            /*greedy=*/false,
+            /*apply_top_k_p=*/false,
+            /*require_cann=*/test_backend_is_cann(backend),
+            /*trace=*/false,
+            error));
+
+    const std::array<float, 4> uniforms = {
+        0.05f, 0.31f, 0.67f, 0.91f,
+    };
+    std::array<int32_t, 4> expected = {};
+    for (int i = 0; i < 4; ++i) {
+        expected[i] = cpu_reference_sample(
+                logits,
+                /*recent=*/{},
+                /*repetition_window=*/8,
+                /*repetition_penalty=*/1.05f,
+                temperature,
+                /*skip_repetition=*/true,
+                /*force_no_eos=*/false,
+                /*apply_top_k_p=*/false,
+                /*top_k=*/8,
+                /*top_p=*/0.85f,
+                /*min_keep=*/3,
+                uniforms[i]);
+    }
+
+    assert(runner.begin_burst(44, uniforms, error));
+    for (int i = 0; i < 4; ++i) {
+        omni::tts_device_head_step step;
+        step.skip_repetition = true;
+        step.has_uniform = true;
+        step.uniform = uniforms[i];
+        llama_device_tensor embedding = {};
+        assert(runner.forward_burst_step(
+                44, hidden, step, embedding, error));
+        assert(embedding.tensor != nullptr);
+        assert(runner.last_transfer_stats().d2h_bytes == 0);
+        assert(runner.last_transfer_stats().control_scalar_d2h_bytes == 0);
+    }
+    omni::tts_device_burst_event event;
+    assert(runner.finish_burst(44, event, error));
+    assert(event.valid_count == 4);
+    assert(event.tokens == expected);
+    assert(runner.last_transfer_stats().d2h_bytes ==
+           4 * sizeof(int32_t));
+    assert(runner.last_transfer_stats().control_scalar_d2h_bytes ==
+           4 * sizeof(int32_t));
+    assert(!runner.finish_burst(44, event, error));
+
+    assert(runner.begin_burst(45, uniforms, error));
+    omni::tts_device_head_step exact_step;
+    exact_step.has_uniform = true;
+    exact_step.uniform = uniforms[0];
+    exact_step.skip_repetition = false;
+    llama_device_tensor unused_embedding = {};
+    assert(!runner.forward_burst_step(
+            45, hidden, exact_step, unused_embedding, error));
+    assert(error.find("device-side repetition history") !=
+           std::string::npos);
+    runner.cancel_burst(46);
+
+    runner.reset();
+    hidden_buffer.reset();
+    hidden_ctx.reset();
+    ggml_backend_free(backend);
+}
+
+static void test_kv_suffix_rollback_contract() {
+    std::string error;
+    int32_t n_past = 20;
+    bool called = false;
+    assert(omni::tts_device_burst_rollback_kv(
+            n_past,
+            3,
+            [&](int32_t p0, int32_t p1) {
+                called = true;
+                assert(p0 == 17);
+                assert(p1 == 20);
+                return true;
+            },
+            error));
+    assert(called);
+    assert(n_past == 17);
+
+    n_past = 20;
+    assert(!omni::tts_device_burst_rollback_kv(
+            n_past,
+            4,
+            [](int32_t, int32_t) { return false; },
+            error));
+    assert(n_past == 20);
+    assert(error == "llama_memory_seq_rm rejected the TTS KV suffix");
+    assert(!omni::tts_device_burst_rollback_kv(
+            n_past,
+            21,
+            [](int32_t, int32_t) { return true; },
+            error));
+    assert(n_past == 20);
+}
+
 int main() {
     test_config();
     test_burst_eos_and_kv_rollback();
@@ -522,6 +692,8 @@ int main() {
     test_greedy_device_graph();
     test_fixed_uniform_32_codes(/*apply_top_k_p=*/false);
     test_fixed_uniform_32_codes(/*apply_top_k_p=*/true);
+    test_no_d2h_four_step_primitive();
+    test_kv_suffix_rollback_contract();
     std::cout << "TTS device head tests passed\n";
     return 0;
 }
