@@ -7086,6 +7086,7 @@ bool voc_hg2_runner::persistent_state::bridge_device_mel(
         return false;
     }
     if (source.backend != bridge_producer_backend || !source.tensor ||
+        !source.tensor->buffer ||
         source.tensor->data !=
             reinterpret_cast<void *>(source.contract.data) ||
         source.tensor->type != GGML_TYPE_F32 ||
@@ -7140,7 +7141,7 @@ bool voc_hg2_runner::persistent_state::bridge_device_mel(
     // backend and performs CTB -> TCB, prepends the persistent 8-frame mel
     // tail, copies into the exact-shape HiFT input, and updates the tail
     // without exposing mel to host memory.
-    constexpr size_t kBridgeGraphNodes = 32;
+    constexpr size_t kBridgeGraphNodes = 64;
     ggml_init_params params{};
     params.mem_size =
         32 * ggml_tensor_overhead() +
@@ -7155,16 +7156,30 @@ bool voc_hg2_runner::persistent_state::bridge_device_mel(
         return false;
     }
 
+    // Do not create a view of source.tensor here.  That tensor is the output
+    // node of the persistent Token2Mel graph, so a normal ggml_view_3d would
+    // retain its src[] lineage.  ggml_build_forward_expand would then walk
+    // the entire producer graph into this bridge graph (and could attempt to
+    // execute it on the HiFT backend).  Instead publish an external leaf with
+    // the same live device allocation and no producer lineage.  Producer
+    // completion is guaranteed by the explicit synchronization contract
+    // validated above.
+    std::string leaf_error;
     ggml_tensor * source_ctb =
-        ggml_view_3d(
+        omni::flow::make_borrowed_device_leaf(
             ctx,
-            const_cast<ggml_tensor *>(source.tensor),
-            source.contract.channels,
-            current_frames,
-            source.contract.batch,
-            static_cast<size_t>(source.stride_bytes[1]),
-            static_cast<size_t>(source.stride_bytes[2]),
-            0);
+            source.tensor,
+            source.contract,
+            source.stride_bytes,
+            leaf_error);
+    if (!source_ctb) {
+        ggml_free(ctx);
+        std::fprintf(
+            stderr,
+            "voc_hg2_runner: %s\n",
+            leaf_error.c_str());
+        return false;
+    }
     ggml_tensor * current_tcb =
         ggml_cont(
             ctx,
@@ -7222,6 +7237,16 @@ bool voc_hg2_runner::persistent_state::bridge_device_mel(
         ggml_new_graph_custom(ctx, kBridgeGraphNodes, false);
     ggml_build_forward_expand(graph, speech_copy);
     ggml_build_forward_expand(graph, tail_copy);
+    constexpr int kMaxExpectedBridgeNodes = 16;
+    if (ggml_graph_n_nodes(graph) > kMaxExpectedBridgeNodes) {
+        ggml_free(ctx);
+        std::fprintf(
+            stderr,
+            "voc_hg2_runner: device mel bridge unexpectedly captured "
+            "producer lineage (nodes=%d)\n",
+            ggml_graph_n_nodes(graph));
+        return false;
+    }
 
     ggml_gallocr_t galloc =
         ggml_gallocr_new(

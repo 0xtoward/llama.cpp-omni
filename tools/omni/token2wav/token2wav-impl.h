@@ -14,6 +14,7 @@
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
 #include "token2wav-device-bridge-policy.h"
+#include "token2wav-device-bridge-graph.h"
 
 namespace omni {
 namespace flow_matching {

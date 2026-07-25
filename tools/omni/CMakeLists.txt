@@ -24,6 +24,7 @@ add_library(omni
             token2wav/token2wav-impl.cpp
             token2wav/token2wav-impl.h
             token2wav/token2wav-backend-policy.h
+            token2wav/token2wav-device-bridge-graph.h
             token2wav/token2wav.cpp
             token2wav/token2wav.h
             token2wav/token2wav-profile.h
@@ -239,6 +240,21 @@ if (LLAMA_BUILD_TESTS)
         COMMAND test-token2wav-backend-policy
     )
     set_tests_properties(token2wav-backend-policy PROPERTIES LABELS "main;omni")
+
+    add_executable(
+        test-token2wav-device-bridge-graph
+        test/test-token2wav-device-bridge-graph.cpp)
+    target_include_directories(
+        test-token2wav-device-bridge-graph PRIVATE .)
+    target_link_libraries(
+        test-token2wav-device-bridge-graph PRIVATE ggml)
+    target_compile_features(
+        test-token2wav-device-bridge-graph PRIVATE cxx_std_17)
+    add_test(
+        NAME token2wav-device-bridge-graph
+        COMMAND test-token2wav-device-bridge-graph)
+    set_tests_properties(
+        token2wav-device-bridge-graph PROPERTIES LABELS "main;omni")
 
     add_executable(test-hift-runner-policy test/test-hift-runner-policy.cpp)
     target_include_directories(test-hift-runner-policy PRIVATE .)
