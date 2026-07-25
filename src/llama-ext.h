@@ -111,6 +111,11 @@ LLAMA_API float * llama_get_embeddings_pre_norm_ith(struct llama_context * ctx, 
 struct llama_device_tensor {
     void * tensor;
     void * backend;
+    // Optional borrowed producer event. When non-null, consumers must enqueue
+    // a wait on their execution backend before reading tensor. The event is
+    // owned by the originating llama_context and is valid for the same period
+    // as tensor.
+    void * ready_event;
     int64_t ne[4];
     int32_t type;
 };
@@ -142,9 +147,11 @@ LLAMA_API bool llama_set_output_contract(
         enum llama_output_contract contract);
 
 // Return a borrowed handle for one row of the latest device embedding output.
-// The producer context is synchronized before the handle is published. The
-// returned metadata view and its graph-owned storage are valid only until the
-// context executes another graph. Passing -1 selects the final live row.
+// A producer event is recorded before the handle is published; consumers must
+// wait on ready_event before reading the tensor. Backends without event support
+// fail closed. The returned metadata view, event, and graph-owned storage are
+// valid only until the context executes another graph. Passing -1 selects the
+// final live row.
 LLAMA_API bool llama_get_embeddings_device_ith(
         struct llama_context * ctx,
         int32_t i,

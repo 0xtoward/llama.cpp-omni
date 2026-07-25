@@ -389,6 +389,9 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    embeddings_device_ready_event.reset();
+    embeddings_device_ready_backend = nullptr;
+
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -915,6 +918,27 @@ bool llama_context::get_embeddings_device_ith(int32_t i, llama_device_tensor * o
         if (!backend) {
             throw std::runtime_error("embedding tensor has no execution backend");
         }
+        auto * device = ggml_backend_get_device(backend);
+        ggml_backend_dev_props props = {};
+        ggml_backend_dev_get_props(device, &props);
+        if (!props.caps.events) {
+            throw std::runtime_error(
+                    format("embedding backend %s does not support producer events",
+                           ggml_backend_name(backend)));
+        }
+        if (!embeddings_device_ready_event ||
+            embeddings_device_ready_backend != backend) {
+            embeddings_device_ready_event.reset();
+            embeddings_device_ready_backend = nullptr;
+            embeddings_device_ready_event.reset(
+                    ggml_backend_event_new(device));
+            if (!embeddings_device_ready_event) {
+                throw std::runtime_error(
+                        format("embedding backend %s failed to create a producer event",
+                               ggml_backend_name(backend)));
+            }
+            embeddings_device_ready_backend = backend;
+        }
 
         // The TTS prefill commonly produces multiple output rows, while its
         // auxiliary head consumes only the final row. Expose a borrowed
@@ -956,6 +980,11 @@ bool llama_context::get_embeddings_device_ith(int32_t i, llama_device_tensor * o
 
         out->tensor  = &embeddings_device_row_view;
         out->backend = backend;
+        // Record after the asynchronously submitted producer graph. The
+        // consumer enqueues its stream wait before touching this borrowed row.
+        ggml_backend_event_record(
+                embeddings_device_ready_event.get(), backend);
+        out->ready_event = embeddings_device_ready_event.get();
         out->type    = static_cast<int32_t>(embeddings_device_row_view.type);
         for (int d = 0; d < 4; ++d) {
             out->ne[d] = embeddings_device_row_view.ne[d];
@@ -3810,16 +3839,6 @@ bool llama_get_embeddings_device_ith(
         llama_context * ctx,
         int32_t i,
         llama_device_tensor * out) {
-    // The returned tensor is consumed by an independently submitted backend
-    // graph (the MiniCPMTTS auxiliary head).  Unlike host getters, merely
-    // borrowing the device pointer does not otherwise establish a dependency
-    // between the producer scheduler stream and that consumer stream.
-    //
-    // Synchronize before publishing the pointer so the consumer cannot observe
-    // a partially-written or previous-step hidden row.  A producer event in
-    // llama_device_tensor can replace this full barrier once all backends can
-    // carry and wait on it.
-    ctx->synchronize();
     return ctx->get_embeddings_device_ith(i, out);
 }
 

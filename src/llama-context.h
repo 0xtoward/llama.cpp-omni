@@ -359,6 +359,12 @@ private:
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
 
+    // Reused producer fence for a borrowed device embedding. It is recorded on
+    // the actual tensor backend and waited by the auxiliary consumer graph.
+    // Reset explicitly in the destructor while its backend device is alive.
+    ggml_backend_event_ptr embeddings_device_ready_event;
+    ggml_backend_t         embeddings_device_ready_backend = nullptr;
+
     // training
     ggml_opt_context_t opt_ctx = nullptr;
 

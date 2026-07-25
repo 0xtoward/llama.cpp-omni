@@ -49,6 +49,32 @@ bool backend_is_cann(ggml_backend_t backend) {
     return normalized.find("cann") != std::string::npos;
 }
 
+bool wait_for_hidden_ready(
+        const llama_device_tensor & hidden,
+        ggml_backend_t consumer_backend,
+        std::string & error) {
+    if (!hidden.ready_event) {
+        // Device tensors produced synchronously by tests, static weights, or a
+        // preceding op on this same stream do not require an external fence.
+        return true;
+    }
+    if (!consumer_backend || hidden.backend != consumer_backend) {
+        error = "TTS hidden producer event requires the same execution backend";
+        return false;
+    }
+    ggml_backend_dev_props props = {};
+    ggml_backend_dev_get_props(
+            ggml_backend_get_device(consumer_backend), &props);
+    if (!props.caps.events) {
+        error = "TTS hidden producer event requires backend event support";
+        return false;
+    }
+    ggml_backend_event_wait(
+            consumer_backend,
+            static_cast<ggml_backend_event_t>(hidden.ready_event));
+    return true;
+}
+
 bool hidden_fingerprint_enabled() {
     const char * value = std::getenv("OMNI_TTS_HIDDEN_FINGERPRINT");
     return value && std::strcmp(value, "1") == 0;
@@ -855,6 +881,9 @@ bool tts_device_head::forward_impl(
         hidden.type != GGML_TYPE_F32 || hidden.ne[0] != pimpl->hidden_size ||
         hidden.ne[1] != 1) {
         error = "TTS device hidden backend/type/shape changed";
+        return false;
+    }
+    if (!wait_for_hidden_ready(hidden, pimpl->backend, error)) {
         return false;
     }
     if (!pimpl->greedy &&

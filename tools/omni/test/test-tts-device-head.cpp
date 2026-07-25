@@ -284,6 +284,23 @@ static void test_greedy_device_graph() {
         assert(std::fabs(got[d] - (30.0f + d)) < 1e-6f);
     }
 
+    if (!test_backend_is_cann(backend)) {
+        // A borrowed asynchronous producer must never be treated as ready on a
+        // backend without event support. The ordinary synchronous synthetic
+        // path above remains valid with ready_event == nullptr.
+        llama_device_tensor unsupported_event_hidden = hidden;
+        unsupported_event_hidden.ready_event =
+                reinterpret_cast<void *>(uintptr_t{1});
+        assert(!runner.forward(
+                unsupported_event_hidden,
+                step,
+                token,
+                selected_embedding,
+                error));
+        assert(error.find("requires backend event support") !=
+               std::string::npos);
+    }
+
     assert(setenv("OMNI_TTS_HIDDEN_FINGERPRINT", "1", 1) == 0);
     step.token_index = 7;
     step.n_past = 31;
