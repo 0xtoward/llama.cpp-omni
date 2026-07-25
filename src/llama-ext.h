@@ -148,9 +148,11 @@ LLAMA_API bool llama_set_output_contract(
 
 // Return a borrowed handle for one row of the latest device embedding output.
 // OMNI_TTS_HIDDEN_FENCE selects the readiness contract:
-//   sync        - synchronize the producer context (default/correctness oracle)
-//   event_sync  - record then Host-synchronize a producer event (diagnostic)
-//   stream_wait - return that event for the consumer stream to wait on
+//   sync         - synchronize the producer context (default/correctness oracle)
+//   backend_sync - synchronize only the tensor's producer backend
+//   event_sync   - record then Host-synchronize a producer event (diagnostic)
+//   stream_wait  - experimentally wait on the event from the consumer stream;
+//                  this does not fence ACL Graph model execution on CANN
 // Invalid values and event modes on unsupported backends fail closed. The
 // returned metadata view, optional event, and graph-owned storage are valid
 // only until the context executes another graph. Passing -1 selects the final

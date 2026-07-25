@@ -81,6 +81,11 @@ static void test_config() {
     assert(fence_sync);
     assert(fence_sync.mode ==
            llama_device_tensor_fence_mode::sync);
+    const auto fence_backend_sync =
+            llama_parse_device_tensor_fence_config("backend_sync");
+    assert(fence_backend_sync);
+    assert(fence_backend_sync.mode ==
+           llama_device_tensor_fence_mode::backend_sync);
     const auto fence_event_sync =
             llama_parse_device_tensor_fence_config("event_sync");
     assert(fence_event_sync);
@@ -95,7 +100,8 @@ static void test_config() {
             llama_parse_device_tensor_fence_config("event");
     assert(!fence_invalid);
     assert(fence_invalid.error ==
-           "OMNI_TTS_HIDDEN_FENCE must be sync|event_sync|stream_wait");
+           "OMNI_TTS_HIDDEN_FENCE must be "
+           "sync|backend_sync|event_sync|stream_wait");
 
     assert(omni::tts_device_head_parse_config(
             nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, config, error));

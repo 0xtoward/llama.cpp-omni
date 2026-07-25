@@ -931,8 +931,19 @@ bool llama_context::get_embeddings_device_ith(int32_t i, llama_device_tensor * o
         if (!backend) {
             throw std::runtime_error("embedding tensor has no execution backend");
         }
-        if (embeddings_device_fence.mode !=
-            llama_device_tensor_fence_mode::sync) {
+        const bool uses_producer_event =
+                embeddings_device_fence.mode ==
+                        llama_device_tensor_fence_mode::event_sync ||
+                embeddings_device_fence.mode ==
+                        llama_device_tensor_fence_mode::stream_wait;
+        if (embeddings_device_fence.mode ==
+            llama_device_tensor_fence_mode::backend_sync) {
+            // ACL Graph execution is not reliably fenced by a subsequent
+            // stream-wait event on CANN. Synchronizing the actual tensor
+            // backend uses its native stream completion primitive without
+            // waiting on unrelated scheduler backends.
+            ggml_backend_synchronize(backend);
+        } else if (uses_producer_event) {
             auto * device = ggml_backend_get_device(backend);
             ggml_backend_dev_props props = {};
             ggml_backend_dev_get_props(device, &props);
@@ -996,12 +1007,11 @@ bool llama_context::get_embeddings_device_ith(int32_t i, llama_device_tensor * o
 
         out->tensor  = &embeddings_device_row_view;
         out->backend = backend;
-        if (embeddings_device_fence.mode !=
-            llama_device_tensor_fence_mode::sync) {
+        if (uses_producer_event) {
             // Diagnostic event modes deliberately share the same record point.
             // event_sync proves whether this backend/event sees the real
-            // producer work; stream_wait additionally tests device-side wait
-            // and event reuse without a Host barrier.
+            // producer work; stream_wait experimentally tests device-side
+            // waiting and must not be used as an ACL Graph completion fence.
             ggml_backend_event_record(
                     embeddings_device_ready_event.get(), backend);
             if (embeddings_device_fence.mode ==
